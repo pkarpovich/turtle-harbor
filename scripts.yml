@@ -1,0 +1,8 @@
+settings:
+  log_dir: "./logs"
+
+scripts:
+  backend:
+    command: "./test.sh"
+    restart_policy: "always"
+    max_restarts: 5
