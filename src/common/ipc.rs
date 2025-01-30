@@ -1,4 +1,5 @@
 use crate::common::error::{Error, Result};
+use crate::common::config::RestartPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::time::Duration;
@@ -7,10 +8,15 @@ use tokio::net::UnixStream;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Command {
-    Up { script_name: Option<String> },
-    Down { script_name: Option<String> },
+    Up {
+        name: String,
+        command: String,
+        restart_policy: RestartPolicy,
+        max_restarts: u32,
+    },
+    Down { name: String },
     Ps,
-    Logs { script_name: Option<String> },
+    Logs { name: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -42,7 +48,7 @@ pub const SOCKET_PATH: &str = "/tmp/turtle-harbor.sock";
 pub async fn send_command(
     stream: &mut UnixStream,
     command: &Command,
-) -> crate::common::error::Result<()> {
+) -> Result<()> {
     let data = serde_json::to_vec(command)?;
     let len = data.len() as u32;
     stream.write_all(&len.to_le_bytes()).await?;
@@ -65,7 +71,7 @@ pub async fn receive_command(stream: &mut UnixStream) -> crate::common::error::R
 pub async fn send_response(
     stream: &mut UnixStream,
     response: &Response,
-) -> crate::common::error::Result<()> {
+) -> Result<()> {
     let data = serde_json::to_vec(response)?;
     let len = data.len() as u32;
     stream.write_all(&len.to_le_bytes()).await?;

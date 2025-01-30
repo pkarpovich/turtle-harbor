@@ -13,14 +13,14 @@ pub struct Settings {
     pub log_dir: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Script {
     pub command: String,
     pub restart_policy: RestartPolicy,
     pub max_restarts: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum RestartPolicy {
     Always,

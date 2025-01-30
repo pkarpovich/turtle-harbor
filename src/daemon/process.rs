@@ -7,47 +7,48 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tokio::time::{self, sleep};
+use tokio::time::{sleep};
 
-use crate::common::config::{Config, RestartPolicy, Script};
+use crate::common::config::{RestartPolicy};
 use crate::common::error::Error;
-use crate::common::ipc::ProcessStatus;
+use crate::common::ipc::{ProcessStatus, ProcessInfo};
 
 pub struct ProcessManager {
-    config: Config,
     processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
 }
 
 pub struct ManagedProcess {
     child: Child,
     name: String,
+    command: String,
     status: ProcessStatus,
     start_time: Option<DateTime<Utc>>,
     restart_count: u32,
     log_file: PathBuf,
+    restart_policy: RestartPolicy,
+    max_restarts: u32,
 }
 
 impl ProcessManager {
-    pub fn new(config: Config) -> Self {
+    pub fn new() -> Self {
         Self {
-            config,
             processes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub async fn start_script(&self, name: &str) -> crate::common::error::Result<()> {
-        let script = self
-            .config
-            .scripts
-            .get(name)
-            .ok_or_else(|| Error::Process(format!("Script {} not found", name)))?;
-
-        std::fs::create_dir_all(&self.config.settings.log_dir)?;
-        let log_path = self.config.settings.log_dir.join(format!("{}.log", name));
+    pub async fn start_script(
+        &self,
+        name: String,
+        command: String,
+        restart_policy: RestartPolicy,
+        max_restarts: u32,
+    ) -> crate::common::error::Result<()> {
+        let log_path = PathBuf::from("logs").join(format!("{}.log", name));
+        std::fs::create_dir_all("logs")?;
 
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(&script.command)
+            .arg(&command)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -59,9 +60,7 @@ impl ProcessManager {
                 let mut line = String::new();
 
                 while let Ok(n) = reader.read_line(&mut line).await {
-                    if n == 0 {
-                        break;
-                    }
+                    if n == 0 { break; }
 
                     if let Ok(mut file) = std::fs::OpenOptions::new()
                         .create(true)
@@ -80,17 +79,19 @@ impl ProcessManager {
 
         let managed_process = ManagedProcess {
             child,
-            name: name.to_string(),
+            name: name.clone(),
+            command,
             status: ProcessStatus::Running,
             start_time: Some(Utc::now()),
             restart_count: 0,
             log_file: log_path,
+            restart_policy,
+            max_restarts,
         };
 
         let mut processes = self.processes.lock().await;
-        processes.insert(name.to_string(), managed_process);
+        processes.insert(name, managed_process);
 
-        println!("Started script: {}", name);
         Ok(())
     }
 
@@ -106,24 +107,16 @@ impl ProcessManager {
         }
     }
 
-    pub async fn get_status(
-        &self,
-    ) -> crate::common::error::Result<Vec<crate::common::ipc::ProcessInfo>> {
+    pub async fn get_status(&self) -> crate::common::error::Result<Vec<ProcessInfo>> {
         let processes = self.processes.lock().await;
         let mut result = Vec::new();
 
         for (name, process) in processes.iter() {
-            let uptime = process
-                .start_time
-                .map(|start_time| {
-                    Utc::now()
-                        .signed_duration_since(start_time)
-                        .to_std()
-                        .unwrap_or_default()
-                })
+            let uptime = process.start_time
+                .map(|start_time| Utc::now().signed_duration_since(start_time).to_std().unwrap_or_default())
                 .unwrap_or_default();
 
-            result.push(crate::common::ipc::ProcessInfo {
+            result.push(ProcessInfo {
                 name: name.clone(),
                 pid: process.child.id().unwrap_or(0),
                 status: process.status.clone(),
@@ -140,34 +133,18 @@ impl ProcessManager {
         if let Some(process) = processes.get(name) {
             Ok(tokio::fs::read_to_string(&process.log_file).await?)
         } else {
-            Err(crate::common::error::Error::Process(format!(
-                "Script {} not found",
-                name
-            )))
+            Err(Error::Process(format!("Script {} not found", name)))
         }
-    }
-
-    pub async fn start_all(&self) -> crate::common::error::Result<()> {
-        let mut processes = self.processes.lock().await;
-        for script_name in self.config.scripts.keys() {
-            if processes.contains_key(script_name) {
-                println!("Script {} is already running", script_name);
-                continue;
-            }
-
-            drop(processes);
-            self.start_script(script_name).await?;
-            processes = self.processes.lock().await;
-        }
-        Ok(())
     }
 
     pub async fn stop_all(&self) -> crate::common::error::Result<()> {
-        let mut processes = self.processes.lock().await;
-        for script_name in processes.keys().cloned().collect::<Vec<_>>() {
-            drop(processes);
-            self.stop_script(&script_name).await?;
-            processes = self.processes.lock().await;
+        let names: Vec<String> = {
+            let processes = self.processes.lock().await;
+            processes.keys().cloned().collect()
+        };
+
+        for name in names {
+            self.stop_script(&name).await?;
         }
         Ok(())
     }
@@ -186,10 +163,7 @@ impl ProcessManager {
                     all_logs.push_str(&format!("\n=== No logs for {} ===\n", name));
                 }
                 Err(e) => {
-                    all_logs.push_str(&format!(
-                        "\n=== Error reading logs for {}: {} ===\n",
-                        name, e
-                    ));
+                    all_logs.push_str(&format!("\n=== Error reading logs for {}: {} ===\n", name, e));
                 }
             }
         }
@@ -197,32 +171,14 @@ impl ProcessManager {
         Ok(all_logs)
     }
 
-    pub async fn monitor_and_restart(&self) {
-        loop {
-            let mut processes = self.processes.lock().await;
-            let process_names: Vec<String> = processes.keys().cloned().collect();
-            drop(processes);
-
-            for name in process_names {
-                self.check_and_restart_if_needed(&name).await;
-            }
-
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-
-    async fn check_and_restart_if_needed(&self, name: &str) {
+    pub async fn check_and_restart_if_needed(&self, name: &str) {
         let should_restart = {
             let mut processes = self.processes.lock().await;
             if let Some(process) = processes.get_mut(name) {
-                if let Ok(Some(status)) = process.child.try_wait() {
-                    if let Some(script) = self.config.scripts.get(name) {
-                        match script.restart_policy {
-                            RestartPolicy::Always => process.restart_count < script.max_restarts,
-                            RestartPolicy::Never => false,
-                        }
-                    } else {
-                        false
+                if let Ok(Some(_)) = process.child.try_wait() {
+                    match process.restart_policy {
+                        RestartPolicy::Always => process.restart_count < process.max_restarts,
+                        RestartPolicy::Never => false,
                     }
                 } else {
                     false
@@ -233,15 +189,43 @@ impl ProcessManager {
         };
 
         if should_restart {
-            let mut processes = self.processes.lock().await;
-            if let Some(process) = processes.get_mut(name) {
-                process.restart_count += 1;
-            }
-            drop(processes);
+            let process_info = {
+                let mut processes = self.processes.lock().await;
+                if let Some(process) = processes.get_mut(name) {
+                    process.restart_count += 1;
+                    (
+                        process.command.clone(),
+                        process.restart_policy.clone(),
+                        process.max_restarts
+                    )
+                } else {
+                    return;
+                }
+            };
 
-            if let Err(e) = self.start_script(name).await {
+            if let Err(e) = self.start_script(
+                name.to_string(),
+                process_info.0,
+                process_info.1,
+                process_info.2
+            ).await {
                 eprintln!("Failed to restart {}: {}", name, e);
             }
+        }
+    }
+
+    pub async fn monitor_and_restart(&self) {
+        loop {
+            let names: Vec<String> = {
+                let processes = self.processes.lock().await;
+                processes.keys().cloned().collect()
+            };
+
+            for name in names {
+                self.check_and_restart_if_needed(&name).await;
+            }
+
+            sleep(Duration::from_secs(1)).await;
         }
     }
 }
