@@ -3,9 +3,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio::time::{self, sleep};
 
 use crate::common::config::{Config, RestartPolicy, Script};
 use crate::common::error::Error;
@@ -193,5 +195,53 @@ impl ProcessManager {
         }
 
         Ok(all_logs)
+    }
+
+    pub async fn monitor_and_restart(&self) {
+        loop {
+            let mut processes = self.processes.lock().await;
+            let process_names: Vec<String> = processes.keys().cloned().collect();
+            drop(processes);
+
+            for name in process_names {
+                self.check_and_restart_if_needed(&name).await;
+            }
+
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn check_and_restart_if_needed(&self, name: &str) {
+        let should_restart = {
+            let mut processes = self.processes.lock().await;
+            if let Some(process) = processes.get_mut(name) {
+                if let Ok(Some(status)) = process.child.try_wait() {
+                    if let Some(script) = self.config.scripts.get(name) {
+                        match script.restart_policy {
+                            RestartPolicy::Always => process.restart_count < script.max_restarts,
+                            RestartPolicy::Never => false,
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if should_restart {
+            let mut processes = self.processes.lock().await;
+            if let Some(process) = processes.get_mut(name) {
+                process.restart_count += 1;
+            }
+            drop(processes);
+
+            if let Err(e) = self.start_script(name).await {
+                eprintln!("Failed to restart {}: {}", name, e);
+            }
+        }
     }
 }

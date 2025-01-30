@@ -8,6 +8,9 @@ use turtle_harbor::common::ipc::{Command, ProcessStatus, Response};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    #[arg(short, long, default_value = "scripts.yml")]
+    config: String,
 }
 
 #[derive(Subcommand)]
