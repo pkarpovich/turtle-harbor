@@ -1,10 +1,37 @@
-use crate::common::error::{Error, Result};
+use crate::common::error::Result;
 use crate::common::config::RestartPolicy;
-use serde::{Deserialize, Serialize};
-use serde_json;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Profile {
+    Development,
+    Production,
+}
+
+impl Profile {
+    pub fn current() -> Self {
+        match std::env::var("PROFILE").as_deref() {
+            Ok("dev") | Ok("debug") => Profile::Development,
+            _ => Profile::Production,
+        }
+    }
+}
+
+pub fn get_socket_path() -> &'static str {
+    const PROD_SOCKET_PATH: &str = "/var/run/turtle-harbor.sock";
+    const DEV_SOCKET_PATH: &str = "/tmp/turtle-harbor.sock";
+
+    println!("Profile: {:?}", Profile::current());
+    println!("Profile: {:?}", std::env::var("PROFILE").as_deref());
+
+    match Profile::current() {
+        Profile::Development => DEV_SOCKET_PATH,
+        Profile::Production => PROD_SOCKET_PATH,
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Command {
@@ -43,20 +70,15 @@ pub enum ProcessStatus {
     Failed,
 }
 
-pub const SOCKET_PATH: &str = "/tmp/turtle-harbor.sock";
-
-pub async fn send_command(
-    stream: &mut UnixStream,
-    command: &Command,
-) -> Result<()> {
-    let data = serde_json::to_vec(command)?;
+async fn send_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<()> {
+    let data = serde_json::to_vec(message)?;
     let len = data.len() as u32;
     stream.write_all(&len.to_le_bytes()).await?;
     stream.write_all(&data).await?;
     Ok(())
 }
 
-pub async fn receive_command(stream: &mut UnixStream) -> crate::common::error::Result<Command> {
+async fn receive_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await?;
     let len = u32::from_le_bytes(len_bytes);
@@ -64,29 +86,21 @@ pub async fn receive_command(stream: &mut UnixStream) -> crate::common::error::R
     let mut buffer = vec![0u8; len as usize];
     stream.read_exact(&mut buffer).await?;
 
-    let command = serde_json::from_slice(&buffer)?;
-    Ok(command)
+    Ok(serde_json::from_slice(&buffer)?)
 }
 
-pub async fn send_response(
-    stream: &mut UnixStream,
-    response: &Response,
-) -> Result<()> {
-    let data = serde_json::to_vec(response)?;
-    let len = data.len() as u32;
-    stream.write_all(&len.to_le_bytes()).await?;
-    stream.write_all(&data).await?;
-    Ok(())
+pub async fn send_command(stream: &mut UnixStream, command: &Command) -> Result<()> {
+    send_message(stream, command).await
 }
 
-pub async fn receive_response(stream: &mut UnixStream) -> crate::common::error::Result<Response> {
-    let mut len_bytes = [0u8; 4];
-    stream.read_exact(&mut len_bytes).await?;
-    let len = u32::from_le_bytes(len_bytes);
+pub async fn receive_command(stream: &mut UnixStream) -> Result<Command> {
+    receive_message(stream).await
+}
 
-    let mut buffer = vec![0u8; len as usize];
-    stream.read_exact(&mut buffer).await?;
+pub async fn send_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
+    send_message(stream, response).await
+}
 
-    let response = serde_json::from_slice(&buffer)?;
-    Ok(response)
+pub async fn receive_response(stream: &mut UnixStream) -> Result<Response> {
+    receive_message(stream).await
 }
