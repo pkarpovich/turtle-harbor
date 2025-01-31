@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -28,7 +28,7 @@ pub struct ManagedProcess {
     child: Child,
     command: String,
     status: ProcessStatus,
-    start_time: Option<DateTime<Utc>>,
+    start_time: Option<DateTime<Local>>,
     restart_count: u32,
     log_file: PathBuf,
     restart_policy: RestartPolicy,
@@ -46,7 +46,7 @@ impl ProcessManager {
         }
     }
 
-    async fn spawn_log_reader<R>(mut reader: BufReader<R>, log_path: PathBuf)
+    async fn spawn_log_reader<R>(mut reader: BufReader<R>, file: Arc<Mutex<std::fs::File>>)
     where
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
@@ -57,14 +57,12 @@ impl ProcessManager {
                 if bytes == 0 {
                     break;
                 }
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
+                let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+                let log_line = format!("[{}] {}\n", timestamp, line.trim());
                 {
-                    let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+                    let mut f = file.lock().await;
                     use std::io::Write;
-                    writeln!(file, "[{}] {}", timestamp, line.trim()).ok();
+                    f.write_all(log_line.as_bytes()).ok();
                 }
                 line.clear();
             }
@@ -74,6 +72,13 @@ impl ProcessManager {
     async fn setup_process_output(command: &str, log_path: &PathBuf) -> Result<ProcessOutput> {
         let log_dir = log_path.parent().unwrap_or_else(|| Path::new("logs"));
         std::fs::create_dir_all(log_dir)?;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        let file = Arc::new(Mutex::new(file));
+
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(command)
@@ -82,11 +87,11 @@ impl ProcessManager {
             .spawn()?;
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
-            Self::spawn_log_reader(reader, log_path.clone()).await;
+            Self::spawn_log_reader(reader, file.clone()).await;
         }
         if let Some(stderr) = child.stderr.take() {
             let reader = BufReader::new(stderr);
-            Self::spawn_log_reader(reader, log_path.clone()).await;
+            Self::spawn_log_reader(reader, file.clone()).await;
         }
         Ok(ProcessOutput { child })
     }
@@ -110,7 +115,7 @@ impl ProcessManager {
             child: output.child,
             command: config.command,
             status: ProcessStatus::Running,
-            start_time: Some(Utc::now()),
+            start_time: Some(Local::now()),
             restart_count: 0,
             log_file: log_path,
             restart_policy: config.restart_policy,
@@ -142,7 +147,7 @@ impl ProcessManager {
                 let uptime = process
                     .start_time
                     .map(|start_time| {
-                        Utc::now()
+                        Local::now()
                             .signed_duration_since(start_time)
                             .to_std()
                             .unwrap_or_default()
