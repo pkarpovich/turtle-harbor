@@ -22,3 +22,4 @@ serde_yaml = "0.9.34"
 terminal_size = "0.4.1"
 thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["full"] }
+tracing-subscriber = "0.3.19"

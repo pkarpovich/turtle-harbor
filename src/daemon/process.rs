@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,39 +46,48 @@ impl ProcessManager {
         }
     }
 
-    async fn setup_process_output(command: &str, log_path: &PathBuf) -> Result<ProcessOutput> {
-        std::fs::create_dir_all("logs")?;
+    async fn spawn_log_reader<R>(mut reader: BufReader<R>, log_path: PathBuf)
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let mut line = String::new();
+            loop {
+                let bytes = reader.read_line(&mut line).await.unwrap_or(0);
+                if bytes == 0 {
+                    break;
+                }
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+                    use std::io::Write;
+                    writeln!(file, "[{}] {}", timestamp, line.trim()).ok();
+                }
+                line.clear();
+            }
+        });
+    }
 
+    async fn setup_process_output(command: &str, log_path: &PathBuf) -> Result<ProcessOutput> {
+        let log_dir = log_path.parent().unwrap_or_else(|| Path::new("logs"));
+        std::fs::create_dir_all(log_dir)?;
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(command)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-
         if let Some(stdout) = child.stdout.take() {
-            let log_path = log_path.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-
-                while let Ok(n) = reader.read_line(&mut line).await {
-                    if n == 0 { break; }
-
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_path)
-                    {
-                        use std::io::Write;
-                        let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
-                        writeln!(file, "[{}] {}", timestamp, line.trim()).ok();
-                    }
-                    line.clear();
-                }
-            });
+            let reader = BufReader::new(stdout);
+            Self::spawn_log_reader(reader, log_path.clone()).await;
         }
-
+        if let Some(stderr) = child.stderr.take() {
+            let reader = BufReader::new(stderr);
+            Self::spawn_log_reader(reader, log_path.clone()).await;
+        }
         Ok(ProcessOutput { child })
     }
 
@@ -95,10 +104,8 @@ impl ProcessManager {
             restart_policy,
             max_restarts,
         };
-
         let log_path = PathBuf::from("logs").join(format!("{}.log", name));
         let output = Self::setup_process_output(&command, &log_path).await?;
-
         let managed_process = ManagedProcess {
             child: output.child,
             command: config.command,
@@ -109,10 +116,8 @@ impl ProcessManager {
             restart_policy: config.restart_policy,
             max_restarts: config.max_restarts,
         };
-
         let mut processes = self.processes.lock().await;
         processes.insert(config.name, managed_process);
-
         Ok(())
     }
 
@@ -125,7 +130,7 @@ impl ProcessManager {
                 process.start_time = None;
                 Ok(())
             }
-            None => Err(Error::Process(format!("Script {} not found", name)))
+            None => Err(Error::Process(format!("Script {} not found", name))),
         }
     }
 
@@ -134,7 +139,8 @@ impl ProcessManager {
         Ok(processes
             .iter()
             .map(|(name, process)| {
-                let uptime = process.start_time
+                let uptime = process
+                    .start_time
                     .map(|start_time| {
                         Utc::now()
                             .signed_duration_since(start_time)
@@ -142,7 +148,6 @@ impl ProcessManager {
                             .unwrap_or_default()
                     })
                     .unwrap_or_default();
-
                 ProcessInfo {
                     name: name.clone(),
                     pid: process.child.id().unwrap_or(0),
@@ -158,7 +163,7 @@ impl ProcessManager {
         let processes = self.processes.lock().await;
         match processes.get(name) {
             Some(process) => Ok(tokio::fs::read_to_string(&process.log_file).await?),
-            None => Err(Error::Process(format!("Script {} not found", name)))
+            None => Err(Error::Process(format!("Script {} not found", name))),
         }
     }
 
@@ -167,7 +172,6 @@ impl ProcessManager {
             let processes = self.processes.lock().await;
             processes.keys().cloned().collect()
         };
-
         for name in names {
             self.stop_script(&name).await?;
         }
@@ -177,17 +181,16 @@ impl ProcessManager {
     pub async fn read_all_logs(&self) -> Result<String> {
         let processes = self.processes.lock().await;
         let mut all_logs = String::new();
-
         for (name, process) in processes.iter() {
             let log_content = match tokio::fs::read_to_string(&process.log_file).await {
                 Ok(logs) => format!("\n=== Logs for {} ===\n{}", name, logs),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
-                    format!("\n=== No logs for {} ===\n", name),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    format!("\n=== No logs for {} ===\n", name)
+                }
                 Err(e) => format!("\n=== Error reading logs for {}: {} ===\n", name, e),
             };
             all_logs.push_str(&log_content);
         }
-
         Ok(all_logs)
     }
 
@@ -214,12 +217,10 @@ impl ProcessManager {
 
     pub async fn check_and_restart_if_needed(&self, name: &str) {
         if let Some((command, policy, max_restarts)) = self.should_restart(name).await {
-            if let Err(e) = self.start_script(
-                name.to_string(),
-                command,
-                policy,
-                max_restarts,
-            ).await {
+            if let Err(e) = self
+                .start_script(name.to_string(), command, policy, max_restarts)
+                .await
+            {
                 eprintln!("Failed to restart {}: {}", name, e);
             }
         }
@@ -231,11 +232,9 @@ impl ProcessManager {
                 let processes = self.processes.lock().await;
                 processes.keys().cloned().collect()
             };
-
             for name in names {
                 self.check_and_restart_if_needed(&name).await;
             }
-
             sleep(Duration::from_secs(1)).await;
         }
     }

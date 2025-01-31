@@ -14,8 +14,11 @@ pub enum Error {
     #[error("Process error: {0}")]
     Process(String),
 
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("JSON serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("YAML deserialization error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1,6 +1,6 @@
-use crate::common::error::Result;
 use crate::common::config::RestartPolicy;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use crate::common::error::Result;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -13,9 +13,10 @@ pub enum Profile {
 
 impl Profile {
     pub fn current() -> Self {
-        match std::env::var("PROFILE").as_deref() {
-            Ok("dev") | Ok("debug") => Profile::Development,
-            _ => Profile::Production,
+        if cfg!(debug_assertions) {
+            Profile::Development
+        } else {
+            Profile::Production
         }
     }
 }
@@ -24,10 +25,9 @@ pub fn get_socket_path() -> &'static str {
     const PROD_SOCKET_PATH: &str = "/var/run/turtle-harbor.sock";
     const DEV_SOCKET_PATH: &str = "/tmp/turtle-harbor.sock";
 
-    println!("Profile: {:?}", Profile::current());
-    println!("Profile: {:?}", std::env::var("PROFILE").as_deref());
-
-    match Profile::current() {
+    let current_profile = Profile::current();
+    eprintln!("Using profile: {:?}", current_profile);
+    match current_profile {
         Profile::Development => DEV_SOCKET_PATH,
         Profile::Production => PROD_SOCKET_PATH,
     }
@@ -41,9 +41,13 @@ pub enum Command {
         restart_policy: RestartPolicy,
         max_restarts: u32,
     },
-    Down { name: String },
+    Down {
+        name: String,
+    },
     Ps,
-    Logs { name: String },
+    Logs {
+        name: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
