@@ -12,6 +12,7 @@ use tokio::time::sleep;
 use crate::common::config::RestartPolicy;
 use crate::common::error::{Error, Result};
 use crate::common::ipc::{ProcessInfo, ProcessStatus};
+use crate::daemon::state::{RunningState, StateStatus};
 
 struct ProcessConfig {
     name: String,
@@ -37,13 +38,34 @@ pub struct ManagedProcess {
 
 pub struct ProcessManager {
     processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
+    state: Arc<Mutex<RunningState>>,
 }
 
 impl ProcessManager {
-    pub fn new() -> Self {
+    pub fn new(state_file: PathBuf) -> Self {
+        let state = RunningState::load(state_file)
+            .map_err(|e| Error::Process(format!("Failed to load state: {}", e)))?;
+
         Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(state)),
         }
+    }
+
+    pub async fn restore_state(&self) -> Result<()> {
+        let state = self.state.lock().await;
+        for script in &state.scripts {
+            if matches!(script.status, StateStatus::Running) && !script.explicitly_stopped {
+                self.start_script(
+                    script.name.clone(),
+                    script.command.clone(),
+                    script.restart_policy.clone(),
+                    script.max_restarts,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn spawn_log_reader<R>(mut reader: BufReader<R>, file: Arc<Mutex<std::fs::File>>)
