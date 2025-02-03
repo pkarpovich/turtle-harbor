@@ -1,7 +1,7 @@
 use crate::common::error::Result;
-use crate::common::ipc::{self, Command, Response};
+use crate::common::ipc::{self, Command, Profile, Response};
 use crate::daemon::process::ProcessManager;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
@@ -12,11 +12,29 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Result<Self> {
+        let state_file = match Profile::current() {
+            Profile::Development => PathBuf::from("/tmp/turtle-harbor-state.json"),
+            Profile::Production => PathBuf::from("/var/lib/turtle-harbor/state.json"),
+        };
+
+        println!("Starting server with state file: {:?}", state_file);
+        let process_manager = match ProcessManager::new(state_file) {
+            Ok(pm) => {
+                println!("Process manager initialized successfully");
+                pm
+            }
+            Err(e) => {
+                eprintln!("Failed to initialize process manager: {}", e);
+                return Err(e);
+            }
+        };
+
+        println!("Creating server instance");
+        Ok(Self {
             socket_path: ipc::get_socket_path().to_string(),
-            process_manager: Arc::new(ProcessManager::new()),
-        }
+            process_manager: Arc::new(process_manager),
+        })
     }
 
     async fn handle_command(process_manager: &ProcessManager, command: Command) -> Response {
@@ -78,8 +96,10 @@ impl Server {
 
     async fn setup_listener(&self) -> Result<UnixListener> {
         if Path::new(&self.socket_path).exists() {
+            println!("Removing existing socket file");
             std::fs::remove_file(&self.socket_path)?;
         }
+        println!("Creating new socket listener at {}", self.socket_path);
         let listener = UnixListener::bind(&self.socket_path)?;
         println!("Server listening on {}", self.socket_path);
         Ok(listener)
@@ -101,12 +121,43 @@ impl Server {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let listener = self.setup_listener().await?;
-        let (mut sigterm, mut sigint) = Self::setup_signal_handlers().await?;
+        println!("Starting server initialization");
+
+        match self.process_manager.restore_state().await {
+            Ok(_) => println!("State restored successfully"),
+            Err(e) => {
+                eprintln!("Failed to restore state: {}", e);
+                return Err(e);
+            }
+        }
+
+        println!("Setting up socket listener");
+        let listener = match self.setup_listener().await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Failed to setup listener: {}", e);
+                return Err(e);
+            }
+        };
+
+        println!("Setting up signal handlers");
+        let (mut sigterm, mut sigint) = match Self::setup_signal_handlers().await {
+            Ok(handlers) => handlers,
+            Err(e) => {
+                eprintln!("Failed to setup signal handlers: {}", e);
+                return Err(e);
+            }
+        };
+
+        println!("Starting process monitor");
         self.start_process_monitor().await;
+
         let process_manager = Arc::clone(&self.process_manager);
+        println!("Starting main server loop");
         tokio::select! {
-            _ = Self::accept_loop(listener, process_manager) => {},
+            result = Self::accept_loop(listener, process_manager) => {
+                println!("Accept loop terminated: {:?}", result);
+            },
             _ = sigterm.recv() => {
                 println!("Received SIGTERM, shutting down...");
             }
@@ -114,11 +165,14 @@ impl Server {
                 println!("Received SIGINT, shutting down...");
             }
         }
+
+        println!("Starting shutdown sequence");
         self.shutdown().await
     }
 
     async fn shutdown(&self) -> Result<()> {
-        self.process_manager.stop_all().await?;
+        self.process_manager.shutdown().await?;
+
         if Path::new(&self.socket_path).exists() {
             std::fs::remove_file(&self.socket_path)?;
         }

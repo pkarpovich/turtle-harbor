@@ -39,14 +39,17 @@ impl RunningState {
         }
     }
 
-    pub fn load(state_file: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(state_file: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         if state_file.exists() {
             let content = std::fs::read_to_string(&state_file)?;
-            let mut state: RunningState = serde_json::from_str(&content)?;
-            state.state_file = state_file;
-            Ok(state)
+            let serializable: RunningState = serde_json::from_str(&content)?;
+            Ok(Self {
+                version: serializable.version,
+                scripts: serializable.scripts.into_iter().map(Into::into).collect(),
+                state_file: state_file.clone(),
+            })
         } else {
-            Ok(RunningState::new(state_file))
+            Ok(RunningState::new(state_file.clone()))
         }
     }
 

@@ -4,6 +4,7 @@ use colored::*;
 use futures::future;
 use std::time::Duration;
 use turtle_harbor::client::commands;
+use turtle_harbor::client::error::handle_error;
 use turtle_harbor::common::config::{Config, Script};
 use turtle_harbor::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
 
@@ -114,8 +115,14 @@ fn print_process_list_table(processes: &[ProcessInfo]) {
 }
 
 #[tokio::main]
-pub async fn main() -> Result<()> {
+pub async fn main() {
     let cli = Cli::parse();
+    if let Err(e) = run(cli).await {
+        handle_error(e.into());
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(&cli.config)?;
 
     match cli.command {

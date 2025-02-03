@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use crate::common::config::RestartPolicy;
 use crate::common::error::{Error, Result};
 use crate::common::ipc::{ProcessInfo, ProcessStatus};
-use crate::daemon::state::{RunningState, StateStatus};
+use crate::daemon::state::{RunningState, ScriptState, ScriptStatus};
 
 struct ProcessConfig {
     name: String,
@@ -42,29 +42,93 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
-    pub fn new(state_file: PathBuf) -> Self {
-        let state = RunningState::load(state_file)
-            .map_err(|e| Error::Process(format!("Failed to load state: {}", e)))?;
+    pub fn new(state_file: PathBuf) -> Result<Self> {
+        println!(
+            "Creating new ProcessManager with state file: {:?}",
+            state_file
+        );
+        let state = RunningState::load(&state_file).map_err(|e| {
+            eprintln!("Failed to load state: {}", e);
+            Error::Process(format!("Failed to load state: {}", e))
+        })?;
 
-        Self {
+        println!("State loaded successfully");
+        println!("Found {} scripts in state", state.scripts.len());
+
+        Ok(Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
             state: Arc::new(Mutex::new(state)),
-        }
+        })
     }
 
     pub async fn restore_state(&self) -> Result<()> {
-        let state = self.state.lock().await;
-        for script in &state.scripts {
-            if matches!(script.status, StateStatus::Running) && !script.explicitly_stopped {
-                self.start_script(
-                    script.name.clone(),
-                    script.command.clone(),
-                    script.restart_policy.clone(),
-                    script.max_restarts,
-                )
-                .await?;
+        println!("Starting state restoration");
+        {
+            let state = self.state.lock().await;
+            let scripts = state.scripts.clone();
+
+            for script in &scripts {
+                println!("Restoring state for {}", script.name);
+                if matches!(script.status, ScriptStatus::Running) && !script.explicitly_stopped {
+                    println!(
+                        "Script {} was running and not explicitly stopped, restarting",
+                        script.name
+                    );
+                    self.start_script(
+                        script.name.clone(),
+                        script.command.clone(),
+                        script.restart_policy.clone(),
+                        script.max_restarts,
+                    )
+                    .await?;
+                }
             }
         }
+        println!("State restoration completed");
+        Ok(())
+    }
+
+    async fn update_script_state(
+        &self,
+        name: &str,
+        status: ScriptStatus,
+        explicitly_stopped: bool,
+    ) -> Result<()> {
+        let script_state = {
+            println!("Getting process info from managed processes");
+            let processes = self.processes.lock().await;
+
+            let proc = processes
+                .get(name)
+                .ok_or_else(|| Error::Process(format!("Script {} not found", name)))?;
+
+            ScriptState {
+                name: name.to_string(),
+                command: proc.command.clone(),
+                restart_policy: proc.restart_policy.clone(),
+                max_restarts: proc.max_restarts,
+                status: status.clone(),
+                last_started: proc.start_time,
+                last_stopped: if matches!(status, ScriptStatus::Stopped | ScriptStatus::Failed) {
+                    Some(Local::now())
+                } else {
+                    None
+                },
+                exit_code: None,
+                explicitly_stopped,
+            }
+        };
+
+        println!("Updating state (acquiring lock)");
+        let state_lock = self.state.lock().await;
+        println!("Lock acquired, updating script state");
+
+        let mut state = state_lock;
+        state
+            .update_script(script_state)
+            .map_err(|e| Error::Process(format!("Failed to update state: {}", e)))?;
+        println!("State updated successfully");
+
         Ok(())
     }
 
@@ -92,8 +156,7 @@ impl ProcessManager {
     }
 
     async fn setup_process_output(command: &str, log_path: &PathBuf) -> Result<ProcessOutput> {
-        let log_dir = log_path.parent().unwrap_or_else(|| Path::new("logs"));
-        std::fs::create_dir_all(log_dir)?;
+        Self::ensure_log_dir()?;
 
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -125,40 +188,95 @@ impl ProcessManager {
         restart_policy: RestartPolicy,
         max_restarts: u32,
     ) -> Result<()> {
-        let config = ProcessConfig {
-            name: name.clone(),
-            command: command.clone(),
-            restart_policy,
-            max_restarts,
+        println!("Starting script {} with command: {}", name, command);
+
+        {
+            let processes = self.processes.lock().await;
+            if processes.contains_key(&name) {
+                println!("Script {} is already running", name);
+                return Ok(());
+            }
+        }
+
+        let log_path = Self::get_log_path(&name);
+        println!("Using log path: {:?}", log_path);
+
+        println!("Setting up process output");
+        let output = match Self::setup_process_output(&command, &log_path).await {
+            Ok(out) => {
+                println!("Process output setup successful");
+                out
+            }
+            Err(e) => {
+                eprintln!("Failed to setup process output: {}", e);
+                return Err(e);
+            }
         };
-        let log_path = PathBuf::from("logs").join(format!("{}.log", name));
-        let output = Self::setup_process_output(&command, &log_path).await?;
+
+        println!("Creating managed process for {}", name);
         let managed_process = ManagedProcess {
             child: output.child,
-            command: config.command,
+            command: command.clone(),
             status: ProcessStatus::Running,
             start_time: Some(Local::now()),
             restart_count: 0,
             log_file: log_path,
-            restart_policy: config.restart_policy,
-            max_restarts: config.max_restarts,
+            restart_policy,
+            max_restarts,
         };
-        let mut processes = self.processes.lock().await;
-        processes.insert(config.name, managed_process);
+
+        println!("Adding process to managed processes");
+        {
+            let mut processes = self.processes.lock().await;
+            processes.insert(name.clone(), managed_process);
+        }
+
+        println!("Updating script state");
+        match self
+            .update_script_state(&name, ScriptStatus::Running, false)
+            .await
+        {
+            Ok(_) => println!("State updated successfully for {}", name),
+            Err(e) => {
+                eprintln!("Failed to update state for {}: {}", name, e);
+                return Err(e);
+            }
+        }
+
+        println!("Script {} started successfully", name);
         Ok(())
     }
 
     pub async fn stop_script(&self, name: &str) -> Result<()> {
-        let mut processes = self.processes.lock().await;
-        match processes.get_mut(name) {
-            Some(process) => {
+        {
+            let mut processes = self.processes.lock().await;
+            if let Some(process) = processes.get_mut(name) {
                 process.child.kill().await?;
                 process.status = ProcessStatus::Stopped;
                 process.start_time = None;
-                Ok(())
+            } else {
+                return Err(Error::Process(format!("Script {} not found", name)));
             }
-            None => Err(Error::Process(format!("Script {} not found", name))),
         }
+
+        self.update_script_state(name, ScriptStatus::Stopped, true)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        let names: Vec<String> = {
+            let processes = self.processes.lock().await;
+            processes.keys().cloned().collect()
+        };
+
+        for name in names {
+            let mut processes = self.processes.lock().await;
+            if let Some(process) = processes.get_mut(&name) {
+                process.child.kill().await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn get_status(&self) -> Result<Vec<ProcessInfo>> {
@@ -187,6 +305,13 @@ impl ProcessManager {
     }
 
     pub async fn read_logs(&self, name: &str) -> Result<String> {
+        Self::ensure_log_dir()?;
+
+        let log_path = Self::get_log_path(name);
+        if !log_path.exists() {
+            return Ok("No logs available yet.".to_string());
+        }
+
         let processes = self.processes.lock().await;
         match processes.get(name) {
             Some(process) => Ok(tokio::fs::read_to_string(&process.log_file).await?),
@@ -264,5 +389,17 @@ impl ProcessManager {
             }
             sleep(Duration::from_secs(1)).await;
         }
+    }
+
+    fn get_log_path(name: &str) -> PathBuf {
+        PathBuf::from("logs").join(format!("{}.log", name))
+    }
+
+    fn ensure_log_dir() -> Result<()> {
+        let log_dir = PathBuf::from("logs");
+        if !log_dir.exists() {
+            std::fs::create_dir_all(&log_dir)?;
+        }
+        Ok(())
     }
 }

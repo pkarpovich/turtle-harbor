@@ -19,6 +19,15 @@ pub enum Error {
 
     #[error("YAML deserialization error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+
+    #[error("Other error: {0}")]
+    Other(String),
+}
+
+impl From<anyhow::Error> for Error {
+    fn from(err: anyhow::Error) -> Self {
+        Error::Other(err.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
