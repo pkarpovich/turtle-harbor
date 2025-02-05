@@ -13,24 +13,24 @@ pub struct Server {
 
 impl Server {
     pub fn new() -> Result<Self> {
+        tracing::info!("Starting server initialization");
         let state_file = match Profile::current() {
             Profile::Development => PathBuf::from("/tmp/turtle-harbor-state.json"),
             Profile::Production => PathBuf::from("/var/lib/turtle-harbor/state.json"),
         };
 
-        println!("Starting server with state file: {:?}", state_file);
+        tracing::info!(state_file = ?state_file, "Using state file");
         let process_manager = match ProcessManager::new(state_file) {
             Ok(pm) => {
-                println!("Process manager initialized successfully");
+                tracing::info!("Process manager initialized successfully");
                 pm
             }
             Err(e) => {
-                eprintln!("Failed to initialize process manager: {}", e);
+                tracing::error!(error = ?e, "Failed to initialize process manager");
                 return Err(e);
             }
         };
 
-        println!("Creating server instance");
         Ok(Self {
             socket_path: ipc::get_socket_path().to_string(),
             process_manager: Arc::new(process_manager),
@@ -68,10 +68,10 @@ impl Server {
 
     async fn handle_client(process_manager: Arc<ProcessManager>, mut stream: UnixStream) {
         while let Ok(command) = ipc::receive_command(&mut stream).await {
-            println!("Received command: {:?}", command);
+            tracing::info!(command = ?command, "Received command");
             let response = Self::handle_command(&process_manager, command).await;
             if let Err(e) = ipc::send_response(&mut stream, &response).await {
-                eprintln!("Failed to send response: {}", e);
+                tracing::error!(error = ?e, "Failed to send response");
                 break;
             }
         }
@@ -80,14 +80,15 @@ impl Server {
     async fn accept_loop(listener: UnixListener, process_manager: Arc<ProcessManager>) {
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => {
+                Ok((stream, addr)) => {
+                    tracing::debug!(addr = ?addr, "Accepted new connection");
                     let pm = Arc::clone(&process_manager);
                     tokio::spawn(async move {
                         Self::handle_client(pm, stream).await;
                     });
                 }
                 Err(e) => {
-                    eprintln!("Accept error: {}", e);
+                    tracing::error!(error = ?e, "Accept error");
                     break;
                 }
             }
@@ -96,17 +97,18 @@ impl Server {
 
     async fn setup_listener(&self) -> Result<UnixListener> {
         if Path::new(&self.socket_path).exists() {
-            println!("Removing existing socket file");
+            tracing::info!(path = ?self.socket_path, "Removing existing socket file");
             std::fs::remove_file(&self.socket_path)?;
         }
-        println!("Creating new socket listener at {}", self.socket_path);
+        tracing::info!(path = ?self.socket_path, "Creating new socket listener");
         let listener = UnixListener::bind(&self.socket_path)?;
-        println!("Server listening on {}", self.socket_path);
+        tracing::info!(path = ?self.socket_path, "Server listening");
         Ok(listener)
     }
 
     async fn setup_signal_handlers(
     ) -> Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
+        tracing::debug!("Setting up signal handlers");
         Ok((
             signal(SignalKind::terminate())?,
             signal(SignalKind::interrupt())?,
@@ -115,68 +117,71 @@ impl Server {
 
     async fn start_process_monitor(&self) {
         let pm = Arc::clone(&self.process_manager);
+        tracing::info!("Starting process monitor");
         tokio::spawn(async move {
             pm.monitor_and_restart().await;
         });
     }
 
     pub async fn run(&self) -> Result<()> {
-        println!("Starting server initialization");
+        tracing::info!("Starting server initialization");
 
         match self.process_manager.restore_state().await {
-            Ok(_) => println!("State restored successfully"),
+            Ok(_) => tracing::info!("State restored successfully"),
             Err(e) => {
-                eprintln!("Failed to restore state: {}", e);
+                tracing::error!(error = ?e, "Failed to restore state");
                 return Err(e);
             }
         }
 
-        println!("Setting up socket listener");
+        tracing::info!("Setting up socket listener");
         let listener = match self.setup_listener().await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Failed to setup listener: {}", e);
+                tracing::error!(error = ?e, "Failed to setup listener");
                 return Err(e);
             }
         };
 
-        println!("Setting up signal handlers");
+        tracing::info!("Setting up signal handlers");
         let (mut sigterm, mut sigint) = match Self::setup_signal_handlers().await {
             Ok(handlers) => handlers,
             Err(e) => {
-                eprintln!("Failed to setup signal handlers: {}", e);
+                tracing::error!(error = ?e, "Failed to setup signal handlers");
                 return Err(e);
             }
         };
 
-        println!("Starting process monitor");
+        tracing::info!("Starting process monitor");
         self.start_process_monitor().await;
 
         let process_manager = Arc::clone(&self.process_manager);
-        println!("Starting main server loop");
+        tracing::info!("Starting main server loop");
         tokio::select! {
             result = Self::accept_loop(listener, process_manager) => {
-                println!("Accept loop terminated: {:?}", result);
+               tracing::info!(result = ?result, "Accept loop terminated");
             },
             _ = sigterm.recv() => {
-                println!("Received SIGTERM, shutting down...");
+               tracing::info!("Received SIGTERM, shutting down...");
             }
             _ = sigint.recv() => {
-                println!("Received SIGINT, shutting down...");
+               tracing::info!("Received SIGINT, shutting down...");
             }
         }
 
-        println!("Starting shutdown sequence");
+        tracing::info!("Starting shutdown sequence");
         self.shutdown().await
     }
 
     async fn shutdown(&self) -> Result<()> {
+        tracing::info!("Shutting down processes");
         self.process_manager.shutdown().await?;
 
         if Path::new(&self.socket_path).exists() {
+            tracing::info!("Removing socket file");
             std::fs::remove_file(&self.socket_path)?;
         }
-        println!("Shutdown complete");
+        tracing::info!("Shutdown complete");
         Ok(())
     }
 }

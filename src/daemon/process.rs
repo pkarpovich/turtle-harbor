@@ -14,13 +14,6 @@ use crate::common::error::{Error, Result};
 use crate::common::ipc::{ProcessInfo, ProcessStatus};
 use crate::daemon::state::{RunningState, ScriptState, ScriptStatus};
 
-struct ProcessConfig {
-    name: String,
-    command: String,
-    restart_policy: RestartPolicy,
-    max_restarts: u32,
-}
-
 struct ProcessOutput {
     child: Child,
 }
@@ -43,17 +36,13 @@ pub struct ProcessManager {
 
 impl ProcessManager {
     pub fn new(state_file: PathBuf) -> Result<Self> {
-        println!(
-            "Creating new ProcessManager with state file: {:?}",
-            state_file
-        );
+        tracing::info!(state_file = ?state_file, "Creating new ProcessManager");
         let state = RunningState::load(&state_file).map_err(|e| {
-            eprintln!("Failed to load state: {}", e);
+            tracing::error!(error = ?e, "Failed to load state");
             Error::Process(format!("Failed to load state: {}", e))
         })?;
 
-        println!("State loaded successfully");
-        println!("Found {} scripts in state", state.scripts.len());
+        tracing::info!(scripts_count = state.scripts.len(), "State loaded successfully");
 
         Ok(Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
@@ -62,29 +51,25 @@ impl ProcessManager {
     }
 
     pub async fn restore_state(&self) -> Result<()> {
-        println!("Starting state restoration");
-        {
+        tracing::info!("Starting state restoration");
+        let scripts_to_restore = {
             let state = self.state.lock().await;
-            let scripts = state.scripts.clone();
+            state.scripts.clone()
+        };
 
-            for script in &scripts {
-                println!("Restoring state for {}", script.name);
-                if matches!(script.status, ScriptStatus::Running) && !script.explicitly_stopped {
-                    println!(
-                        "Script {} was running and not explicitly stopped, restarting",
-                        script.name
-                    );
-                    self.start_script(
-                        script.name.clone(),
-                        script.command.clone(),
-                        script.restart_policy.clone(),
-                        script.max_restarts,
-                    )
+        for script in &scripts_to_restore {
+            if matches!(script.status, ScriptStatus::Running) && !script.explicitly_stopped {
+                tracing::info!(script = %script.name, "Restoring script");
+                self.start_script(
+                    script.name.clone(),
+                    script.command.clone(),
+                    script.restart_policy.clone(),
+                    script.max_restarts,
+                )
                     .await?;
-                }
             }
         }
-        println!("State restoration completed");
+        tracing::info!("State restoration completed");
         Ok(())
     }
 
@@ -94,8 +79,9 @@ impl ProcessManager {
         status: ScriptStatus,
         explicitly_stopped: bool,
     ) -> Result<()> {
+        tracing::debug!(script = %name, ?status, explicitly_stopped, "Updating script state");
+
         let script_state = {
-            println!("Getting process info from managed processes");
             let processes = self.processes.lock().await;
 
             let proc = processes
@@ -119,16 +105,12 @@ impl ProcessManager {
             }
         };
 
-        println!("Updating state (acquiring lock)");
-        let state_lock = self.state.lock().await;
-        println!("Lock acquired, updating script state");
-
-        let mut state = state_lock;
+        let mut state = self.state.lock().await;
         state
             .update_script(script_state)
             .map_err(|e| Error::Process(format!("Failed to update state: {}", e)))?;
-        println!("State updated successfully");
 
+        tracing::debug!(script = %name, "State updated successfully");
         Ok(())
     }
 
@@ -139,23 +121,29 @@ impl ProcessManager {
         tokio::spawn(async move {
             let mut line = String::new();
             loop {
-                let bytes = reader.read_line(&mut line).await.unwrap_or(0);
-                if bytes == 0 {
-                    break;
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+                        let log_line = format!("[{}] {}\n", timestamp, line.trim());
+                        let mut f = file.lock().await;
+                        use std::io::Write;
+                        if let Err(e) = f.write_all(log_line.as_bytes()) {
+                            tracing::error!(error = ?e, "Failed to write to log file");
+                        }
+                        line.clear();
+                    }
+                    Err(e) => {
+                        tracing::error!(error = ?e, "Error reading line");
+                        break;
+                    }
                 }
-                let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-                let log_line = format!("[{}] {}\n", timestamp, line.trim());
-                {
-                    let mut f = file.lock().await;
-                    use std::io::Write;
-                    f.write_all(log_line.as_bytes()).ok();
-                }
-                line.clear();
             }
         });
     }
 
     async fn setup_process_output(command: &str, log_path: &PathBuf) -> Result<ProcessOutput> {
+        tracing::debug!(command = %command, path = ?log_path, "Setting up process output");
         Self::ensure_log_dir()?;
 
         let file = std::fs::OpenOptions::new()
@@ -178,6 +166,8 @@ impl ProcessManager {
             let reader = BufReader::new(stderr);
             Self::spawn_log_reader(reader, file.clone()).await;
         }
+
+        tracing::debug!("Process output setup completed");
         Ok(ProcessOutput { child })
     }
 
@@ -188,32 +178,26 @@ impl ProcessManager {
         restart_policy: RestartPolicy,
         max_restarts: u32,
     ) -> Result<()> {
-        println!("Starting script {} with command: {}", name, command);
+        tracing::info!(
+            script = %name,
+            command = %command,
+            ?restart_policy,
+            max_restarts,
+            "Starting script"
+        );
 
         {
             let processes = self.processes.lock().await;
             if processes.contains_key(&name) {
-                println!("Script {} is already running", name);
+                tracing::info!(script = %name, "Script is already running");
                 return Ok(());
             }
         }
 
         let log_path = Self::get_log_path(&name);
-        println!("Using log path: {:?}", log_path);
+        tracing::debug!(script = %name, log_path = ?log_path, "Setting up process output");
 
-        println!("Setting up process output");
-        let output = match Self::setup_process_output(&command, &log_path).await {
-            Ok(out) => {
-                println!("Process output setup successful");
-                out
-            }
-            Err(e) => {
-                eprintln!("Failed to setup process output: {}", e);
-                return Err(e);
-            }
-        };
-
-        println!("Creating managed process for {}", name);
+        let output = Self::setup_process_output(&command, &log_path).await?;
         let managed_process = ManagedProcess {
             child: output.child,
             command: command.clone(),
@@ -225,57 +209,53 @@ impl ProcessManager {
             max_restarts,
         };
 
-        println!("Adding process to managed processes");
         {
             let mut processes = self.processes.lock().await;
             processes.insert(name.clone(), managed_process);
         }
 
-        println!("Updating script state");
-        match self
-            .update_script_state(&name, ScriptStatus::Running, false)
-            .await
-        {
-            Ok(_) => println!("State updated successfully for {}", name),
-            Err(e) => {
-                eprintln!("Failed to update state for {}: {}", name, e);
-                return Err(e);
-            }
-        }
-
-        println!("Script {} started successfully", name);
+        self.update_script_state(&name, ScriptStatus::Running, false).await?;
+        tracing::info!(script = %name, "Script started successfully");
         Ok(())
     }
 
     pub async fn stop_script(&self, name: &str) -> Result<()> {
+        tracing::info!(script = %name, "Stopping script");
         {
             let mut processes = self.processes.lock().await;
             if let Some(process) = processes.get_mut(name) {
                 process.child.kill().await?;
                 process.status = ProcessStatus::Stopped;
                 process.start_time = None;
+                tracing::debug!(script = %name, "Process killed");
             } else {
+                tracing::error!(script = %name, "Script not found");
                 return Err(Error::Process(format!("Script {} not found", name)));
             }
         }
 
         self.update_script_state(name, ScriptStatus::Stopped, true)
             .await?;
+        tracing::info!(script = %name, "Script stopped successfully");
         Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        tracing::info!("Shutting down all processes");
         let names: Vec<String> = {
             let processes = self.processes.lock().await;
             processes.keys().cloned().collect()
         };
 
         for name in names {
+            tracing::debug!(script = %name, "Killing process");
             let mut processes = self.processes.lock().await;
             if let Some(process) = processes.get_mut(&name) {
                 process.child.kill().await?;
             }
         }
+
+        tracing::info!("All processes shut down");
         Ok(())
     }
 
@@ -353,13 +333,22 @@ impl ProcessManager {
                 match process.restart_policy {
                     RestartPolicy::Always if process.restart_count < process.max_restarts => {
                         process.restart_count += 1;
+                        tracing::info!(
+                           script = %name,
+                           restart_count = process.restart_count,
+                           max_restarts = process.max_restarts,
+                           "Restarting process"
+                       );
                         Some((
                             process.command.clone(),
                             process.restart_policy.clone(),
                             process.max_restarts,
                         ))
                     }
-                    _ => None,
+                    _ => {
+                        tracing::debug!(script = %name, "Process will not be restarted");
+                        None
+                    }
                 }
             } else {
                 None
@@ -373,12 +362,13 @@ impl ProcessManager {
                 .start_script(name.to_string(), command, policy, max_restarts)
                 .await
             {
-                eprintln!("Failed to restart {}: {}", name, e);
+                tracing::error!(script = %name, error = ?e, "Failed to restart script");
             }
         }
     }
 
     pub async fn monitor_and_restart(&self) {
+        tracing::info!("Starting process monitor");
         loop {
             let names: Vec<String> = {
                 let processes = self.processes.lock().await;
@@ -392,12 +382,15 @@ impl ProcessManager {
     }
 
     fn get_log_path(name: &str) -> PathBuf {
-        PathBuf::from("logs").join(format!("{}.log", name))
+        let path = PathBuf::from("logs").join(format!("{}.log", name));
+        tracing::trace!(script = %name, path = ?path, "Generated log path");
+        path
     }
 
     fn ensure_log_dir() -> Result<()> {
         let log_dir = PathBuf::from("logs");
         if !log_dir.exists() {
+            tracing::debug!(path = ?log_dir, "Creating log directory");
             std::fs::create_dir_all(&log_dir)?;
         }
         Ok(())

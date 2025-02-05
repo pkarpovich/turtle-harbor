@@ -26,11 +26,12 @@ pub fn get_socket_path() -> &'static str {
     const DEV_SOCKET_PATH: &str = "/tmp/turtle-harbor.sock";
 
     let current_profile = Profile::current();
-    eprintln!("Using profile: {:?}", current_profile);
-    match current_profile {
+    let path = match current_profile {
         Profile::Development => DEV_SOCKET_PATH,
         Profile::Production => PROD_SOCKET_PATH,
-    }
+    };
+    tracing::debug!(socket_path = path, "Using socket path");
+    path
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -77,6 +78,7 @@ pub enum ProcessStatus {
 async fn send_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<()> {
     let data = serde_json::to_vec(message)?;
     let len = data.len() as u32;
+    tracing::trace!(message_len = len, "Sending message");
     stream.write_all(&len.to_le_bytes()).await?;
     stream.write_all(&data).await?;
     Ok(())
@@ -86,25 +88,34 @@ async fn receive_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await?;
     let len = u32::from_le_bytes(len_bytes);
+    tracing::trace!(message_len = len, "Receiving message");
 
     let mut buffer = vec![0u8; len as usize];
     stream.read_exact(&mut buffer).await?;
 
-    Ok(serde_json::from_slice(&buffer)?)
+    let message = serde_json::from_slice(&buffer)?;
+    tracing::trace!("Message deserialized successfully");
+    Ok(message)
 }
 
 pub async fn send_command(stream: &mut UnixStream, command: &Command) -> Result<()> {
+    tracing::debug!(command = ?command, "Sending command");
     send_message(stream, command).await
 }
 
 pub async fn receive_command(stream: &mut UnixStream) -> Result<Command> {
-    receive_message(stream).await
+    let command = receive_message(stream).await?;
+    tracing::debug!(command = ?command, "Received command");
+    Ok(command)
 }
 
 pub async fn send_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
+    tracing::debug!(response = ?response, "Sending response");
     send_message(stream, response).await
 }
 
 pub async fn receive_response(stream: &mut UnixStream) -> Result<Response> {
-    receive_message(stream).await
+    let response = receive_message(stream).await?;
+    tracing::debug!(response = ?response, "Received response");
+    Ok(response)
 }
