@@ -42,7 +42,10 @@ impl ProcessManager {
             Error::Process(format!("Failed to load state: {}", e))
         })?;
 
-        tracing::info!(scripts_count = state.scripts.len(), "State loaded successfully");
+        tracing::info!(
+            scripts_count = state.scripts.len(),
+            "State loaded successfully"
+        );
 
         Ok(Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
@@ -66,7 +69,7 @@ impl ProcessManager {
                     script.restart_policy.clone(),
                     script.max_restarts,
                 )
-                    .await?;
+                .await?;
             }
         }
         tracing::info!("State restoration completed");
@@ -214,7 +217,8 @@ impl ProcessManager {
             processes.insert(name.clone(), managed_process);
         }
 
-        self.update_script_state(&name, ScriptStatus::Running, false).await?;
+        self.update_script_state(&name, ScriptStatus::Running, false)
+            .await?;
         tracing::info!(script = %name, "Script started successfully");
         Ok(())
     }
@@ -225,9 +229,8 @@ impl ProcessManager {
             let mut processes = self.processes.lock().await;
             if let Some(process) = processes.get_mut(name) {
                 process.child.kill().await?;
-                process.status = ProcessStatus::Stopped;
-                process.start_time = None;
-                tracing::debug!(script = %name, "Process killed");
+                processes.remove(name);
+                tracing::debug!(script = %name, "Process killed and removed");
             } else {
                 tracing::error!(script = %name, "Script not found");
                 return Err(Error::Process(format!("Script {} not found", name)));
@@ -334,11 +337,11 @@ impl ProcessManager {
                     RestartPolicy::Always if process.restart_count < process.max_restarts => {
                         process.restart_count += 1;
                         tracing::info!(
-                           script = %name,
-                           restart_count = process.restart_count,
-                           max_restarts = process.max_restarts,
-                           "Restarting process"
-                       );
+                            script = %name,
+                            restart_count = process.restart_count,
+                            max_restarts = process.max_restarts,
+                            "Restarting process"
+                        );
                         Some((
                             process.command.clone(),
                             process.restart_policy.clone(),
