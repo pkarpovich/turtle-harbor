@@ -1,6 +1,7 @@
 use crate::common::error::Result;
 use crate::common::ipc::{self, Command, Profile, Response};
 use crate::daemon::process::ProcessManager;
+use crate::daemon::process_monitor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -116,10 +117,17 @@ impl Server {
     }
 
     async fn start_process_monitor(&self) {
+        let processes = self.process_manager.get_processes();
         let pm = Arc::clone(&self.process_manager);
-        tracing::info!("Starting process monitor");
+
+        let restart_handler = Arc::new(move |name, command, policy, max_restarts| {
+            let pm = Arc::clone(&pm);
+            async move { pm.start_script(name, command, policy, max_restarts).await }
+        });
+
+        tracing::info!("Starting process monitor using process_monitor module");
         tokio::spawn(async move {
-            pm.monitor_and_restart().await;
+            process_monitor::monitor_and_restart(processes, restart_handler).await;
         });
     }
 
