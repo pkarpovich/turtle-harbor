@@ -49,7 +49,7 @@ brews:
       keep_alive true
       working_dir var/"lib/turtle-harbor"
       log_path var/"log/turtle-harbor/daemon.log"
-      error_log_path var/"log/turtle-harbor/daemon.error.lo
+      error_log_path var/"log/turtle-harbor/daemon.error.log"
 
 changelog:
   sort: asc
