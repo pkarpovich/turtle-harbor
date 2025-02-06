@@ -1,0 +1,60 @@
+version: 2
+
+before:
+  hooks:
+    - rustup default stable
+    - cargo install --locked cargo-zigbuild
+    - cargo fetch --locked
+
+builds:
+  - builder: rust
+    id: turtled
+    binary: turtled
+    flags:
+      - --release
+      - --bin
+      - turtled
+    targets:
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+
+  - builder: rust
+    id: th
+    binary: th
+    flags:
+      - --release
+      - --bin
+      - th
+    targets:
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+
+brews:
+  - name: turtle-harbor
+    repository:
+      owner: pkarpovich
+      name: homebrew-apps
+    commit_author:
+      name: Pavel Karpovich
+      email: pavel.karpovich@outlook.com
+    homepage: https://github.com/pkarpovich/turtle-harbor
+    description: "Script manager daemon for macOS"
+    install: |
+      bin.install "th"
+      bin.install "turtled"
+      (var/"lib/turtle-harbor").mkpath
+      (var/"log/turtle-harbor").mkpath
+    service: |
+      run [opt_bin/"turtled"]
+      keep_alive true
+      working_dir var/"lib/turtle-harbor"
+      log_path var/"log/turtle-harbor/daemon.log"
+      error_log_path var/"log/turtle-harbor/daemon.error.lo
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
