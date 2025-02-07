@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
@@ -142,13 +143,18 @@ async fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::Up { script_name } => {
-            process_command_for_scripts(script_name, &config, |name, script| Command::Up {
-                name: name.to_string(),
-                command: script.command.clone(),
-                restart_policy: script.restart_policy.clone(),
-                max_restarts: script.max_restarts,
+            process_command_for_scripts(script_name, &config, |name, script| {
+                let path = std::fs::canonicalize(&script.command)
+                    .unwrap_or_else(|_| PathBuf::from(&script.command));
+
+                Command::Up {
+                    restart_policy: script.restart_policy.clone(),
+                    command: path.to_string_lossy().to_string(),
+                    max_restarts: script.max_restarts,
+                    name: name.to_string(),
+                }
             })
-            .await?;
+                .await?;
         }
         Commands::Down { script_name } => {
             process_command_for_scripts(script_name, &config, |name, _| Command::Down {
