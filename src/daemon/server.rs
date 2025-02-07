@@ -15,9 +15,13 @@ pub struct Server {
 impl Server {
     pub fn new() -> Result<Self> {
         tracing::info!("Starting server initialization");
+        let brew_var =
+            std::env::var("HOMEBREW_VAR").unwrap_or_else(|_| "/opt/homebrew/var".to_string());
         let state_file = match Profile::current() {
             Profile::Development => PathBuf::from("/tmp/turtle-harbor-state.json"),
-            Profile::Production => PathBuf::from("/var/lib/turtle-harbor/state.json"),
+            Profile::Production => {
+                PathBuf::from(format!("{}/lib/turtle-harbor/state.json", brew_var))
+            }
         };
 
         tracing::info!(state_file = ?state_file, "Using state file");

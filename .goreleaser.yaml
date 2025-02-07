@@ -47,7 +47,6 @@ brews:
     service: |
       run [opt_bin/"turtled"]
       keep_alive true
-      sudo true
       working_dir var/"lib/turtle-harbor"
       log_path var/"log/turtle-harbor/daemon.log"
       error_log_path var/"log/turtle-harbor/daemon.error.log"
