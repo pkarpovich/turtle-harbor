@@ -199,6 +199,8 @@ impl ProcessManager {
 
     pub async fn stop_script(&self, name: &str) -> Result<()> {
         tracing::info!(script = %name, "Stopping script");
+        self.update_script_state(name, ScriptStatus::Stopped, true)
+            .await?;
 
         let process_opt = {
             let mut processes = self.processes.lock().await;
@@ -213,8 +215,6 @@ impl ProcessManager {
             return Err(Error::Process(format!("Script {} not found", name)));
         }
 
-        self.update_script_state(name, ScriptStatus::Stopped, true)
-            .await?;
         tracing::info!(script = %name, "Script stopped successfully");
         Ok(())
     }
