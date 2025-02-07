@@ -22,16 +22,13 @@ impl Profile {
 }
 
 pub fn get_socket_path() -> &'static str {
-    let brew_var =
-        std::env::var("HOMEBREW_VAR").unwrap_or_else(|_| "/opt/homebrew/var".to_string());
-
-    let prod_socket_path = format!("{}/run/turtle-harbor.sock", brew_var);
+    const PROD_SOCKET_PATH: &str = "/opt/homebrew/var/run/turtle-harbor.sock";
     const DEV_SOCKET_PATH: &str = "/tmp/turtle-harbor.sock";
 
     let current_profile = Profile::current();
     let path = match current_profile {
         Profile::Development => DEV_SOCKET_PATH,
-        Profile::Production => prod_socket_path.as_str(),
+        Profile::Production => PROD_SOCKET_PATH,
     };
     tracing::debug!(socket_path = path, "Using socket path");
     path
