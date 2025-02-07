@@ -130,17 +130,9 @@ impl ProcessManager {
             .open(log_path)?;
         let file = Arc::new(Mutex::new(file));
 
-        let abs_command = if command.starts_with("./") {
-            let current_dir = std::env::current_dir()?;
-            let script_path = current_dir.join(&command[2..]);
-            script_path.to_string_lossy().to_string()
-        } else {
-            command.to_string()
-        };
-
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(abs_command)
+            .arg(command)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
