@@ -2,11 +2,11 @@ use crate::common::error::Result;
 use crate::common::ipc::{self, Command, Profile, Response};
 use crate::daemon::process::ProcessManager;
 use crate::daemon::process_monitor;
+use crate::daemon::scheduler::CronScheduler;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
-use crate::daemon::scheduler::CronScheduler;
 
 pub struct Server {
     socket_path: String,
@@ -126,9 +126,12 @@ impl Server {
         let processes = self.process_manager.get_processes();
         let pm = Arc::clone(&self.process_manager);
 
-        let restart_handler = Arc::new(move |name, command, policy, max_restarts, _, cron | {
+        let restart_handler = Arc::new(move |name, command, policy, max_restarts, _, cron| {
             let pm = Arc::clone(&pm);
-            async move { pm.start_script(name, command, policy, max_restarts, cron).await }
+            async move {
+                pm.start_script(name, command, policy, max_restarts, cron)
+                    .await
+            }
         });
 
         tracing::info!("Starting process monitor using process_monitor module");
@@ -139,7 +142,10 @@ impl Server {
 
     async fn start_scheduler(&self) {
         let process_manager = Arc::clone(&self.process_manager);
-        let scheduler = CronScheduler::new(process_manager);
+        let (mut scheduler, scheduler_tx) = CronScheduler::new(process_manager);
+
+        let mut pm = self.process_manager.as_ref().clone();
+        pm.set_scheduler_tx(scheduler_tx);
 
         tokio::spawn(async move {
             if let Err(e) = scheduler.start().await {
@@ -211,5 +217,15 @@ impl Server {
         }
         tracing::info!("Shutdown complete");
         Ok(())
+    }
+}
+
+impl Clone for ProcessManager {
+    fn clone(&self) -> Self {
+        Self {
+            processes: Arc::clone(&self.processes),
+            state: Arc::clone(&self.state),
+            scheduler_tx: self.scheduler_tx.clone(),
+        }
     }
 }

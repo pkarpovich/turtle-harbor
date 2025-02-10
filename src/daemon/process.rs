@@ -6,12 +6,14 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::BufReader;
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
 
 use crate::common::config::RestartPolicy;
 use crate::common::error::{Error, Result};
 use crate::common::ipc::{ProcessInfo, ProcessStatus};
 use crate::daemon::log_monitor;
+use crate::daemon::scheduler::SchedulerMessage;
 use crate::daemon::state::{RunningState, ScriptState, ScriptStatus};
 
 struct ProcessOutput {
@@ -31,8 +33,9 @@ pub struct ManagedProcess {
 }
 
 pub struct ProcessManager {
-    processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
-    state: Arc<Mutex<RunningState>>,
+    pub processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
+    pub scheduler_tx: Option<Sender<SchedulerMessage>>,
+    pub state: Arc<Mutex<RunningState>>,
 }
 
 #[derive(Debug)]
@@ -58,6 +61,7 @@ impl ProcessManager {
         Ok(Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
             state: Arc::new(Mutex::new(state)),
+            scheduler_tx: None,
         })
     }
 
@@ -136,6 +140,20 @@ impl ProcessManager {
         Arc::clone(&self.processes)
     }
 
+    pub fn set_scheduler_tx(&mut self, tx: Sender<SchedulerMessage>) {
+        tracing::debug!("Setting scheduler tx");
+        self.scheduler_tx = Some(tx);
+    }
+
+    async fn notify_scheduler(&self, msg: SchedulerMessage) {
+        if let Some(tx) = &self.scheduler_tx {
+            tracing::debug!(message = ?msg, "Notifying scheduler");
+            if let Err(e) = tx.send(msg).await {
+                tracing::error!(error = ?e, "Failed to notify scheduler");
+            }
+        }
+    }
+
     async fn setup_process_output(command: &str, log_path: &PathBuf) -> Result<ProcessOutput> {
         tracing::debug!(command = %command, path = ?log_path, "Setting up process output");
         log_monitor::ensure_log_dir()?;
@@ -179,11 +197,11 @@ impl ProcessManager {
                         "Previous process has finished, starting new instance"
                     );
                     Ok(None)
-                },
+                }
                 Ok(None) => {
                     tracing::info!(script = %name, "Script is still running - skipping execution");
                     Ok(Some(ScriptStartResult::AlreadyRunning))
-                },
+                }
                 Err(e) => {
                     tracing::error!(
                         script = %name,
@@ -191,7 +209,10 @@ impl ProcessManager {
                         "Error checking process status"
                     );
                     processes.remove(name);
-                    Err(Error::Process(format!("Error checking process status: {}", e)))
+                    Err(Error::Process(format!(
+                        "Error checking process status: {}",
+                        e
+                    )))
                 }
             }
         } else {
@@ -241,6 +262,9 @@ impl ProcessManager {
         self.update_script_state(&name, ScriptStatus::Running, false, cron)
             .await?;
         tracing::info!(script = %name, "Script started successfully");
+        self.notify_scheduler(SchedulerMessage::ScriptUpdated(name.clone()))
+            .await;
+
         Ok(ScriptStartResult::Started)
     }
 
@@ -270,6 +294,9 @@ impl ProcessManager {
         }
 
         tracing::info!(script = %name, "Script stopped successfully");
+        self.notify_scheduler(SchedulerMessage::ScriptRemoved(name.to_string()))
+            .await;
+
         Ok(())
     }
 
