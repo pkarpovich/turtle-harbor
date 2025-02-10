@@ -152,6 +152,7 @@ async fn run(cli: Cli) -> Result<()> {
                     command: path.to_string_lossy().to_string(),
                     max_restarts: script.max_restarts,
                     name: name.to_string(),
+                    cron: script.cron.clone(),
                 }
             })
                 .await?;

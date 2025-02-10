@@ -41,6 +41,7 @@ pub enum Command {
         command: String,
         restart_policy: RestartPolicy,
         max_restarts: u32,
+        cron: Option<String>,
     },
     Down {
         name: String,

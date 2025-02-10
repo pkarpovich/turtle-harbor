@@ -21,6 +21,7 @@ pub struct ScriptState {
     pub last_stopped: Option<DateTime<Local>>,
     pub exit_code: Option<i32>,
     pub explicitly_stopped: bool,
+    pub cron: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

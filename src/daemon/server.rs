@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
+use crate::daemon::scheduler::CronScheduler;
 
 pub struct Server {
     socket_path: String,
@@ -49,8 +50,9 @@ impl Server {
                 command,
                 restart_policy,
                 max_restarts,
+                cron,
             } => match process_manager
-                .start_script(name, command, restart_policy, max_restarts)
+                .start_script(name, command, restart_policy, max_restarts, cron)
                 .await
             {
                 Ok(_) => Response::Success,
@@ -124,14 +126,25 @@ impl Server {
         let processes = self.process_manager.get_processes();
         let pm = Arc::clone(&self.process_manager);
 
-        let restart_handler = Arc::new(move |name, command, policy, max_restarts| {
+        let restart_handler = Arc::new(move |name, command, policy, max_restarts, _, cron | {
             let pm = Arc::clone(&pm);
-            async move { pm.start_script(name, command, policy, max_restarts).await }
+            async move { pm.start_script(name, command, policy, max_restarts, cron).await }
         });
 
         tracing::info!("Starting process monitor using process_monitor module");
         tokio::spawn(async move {
             process_monitor::monitor_and_restart(processes, restart_handler).await;
+        });
+    }
+
+    async fn start_scheduler(&self) {
+        let process_manager = Arc::clone(&self.process_manager);
+        let scheduler = CronScheduler::new(process_manager);
+
+        tokio::spawn(async move {
+            if let Err(e) = scheduler.start().await {
+                tracing::error!(error = ?e, "Cron scheduler error");
+            }
         });
     }
 
@@ -166,6 +179,9 @@ impl Server {
 
         tracing::info!("Starting process monitor");
         self.start_process_monitor().await;
+
+        tracing::info!("Starting cron scheduler");
+        self.start_scheduler().await;
 
         let process_manager = Arc::clone(&self.process_manager);
         tracing::info!("Starting main server loop");

@@ -6,3 +6,4 @@ scripts:
     command: "./test.sh"
     restart_policy: "always"
     max_restarts: 5
+    cron: "0 */1 * * * * *"

@@ -19,6 +19,7 @@ pub struct Script {
     pub command: String,
     pub restart_policy: RestartPolicy,
     pub max_restarts: u32,
+    pub cron: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

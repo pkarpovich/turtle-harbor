@@ -27,11 +27,19 @@ pub struct ManagedProcess {
     pub log_file: PathBuf,
     pub restart_policy: RestartPolicy,
     pub max_restarts: u32,
+    pub cron: Option<String>,
 }
 
 pub struct ProcessManager {
     processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
     state: Arc<Mutex<RunningState>>,
+}
+
+#[derive(Debug)]
+pub enum ScriptStartResult {
+    Started,
+    AlreadyRunning,
+    Error(Error),
 }
 
 impl ProcessManager {
@@ -68,6 +76,7 @@ impl ProcessManager {
                     script.command,
                     script.restart_policy,
                     script.max_restarts,
+                    script.cron,
                 )
                 .await?;
             }
@@ -81,6 +90,7 @@ impl ProcessManager {
         name: &str,
         status: ScriptStatus,
         explicitly_stopped: bool,
+        cron: Option<String>,
     ) -> Result<()> {
         tracing::debug!(script = %name, ?status, explicitly_stopped, "Updating script state");
 
@@ -104,6 +114,7 @@ impl ProcessManager {
                 },
                 exit_code: None,
                 explicitly_stopped,
+                cron,
             }
         };
 
@@ -114,6 +125,11 @@ impl ProcessManager {
 
         tracing::debug!(script = %name, "State updated successfully");
         Ok(())
+    }
+
+    pub async fn get_state(&self) -> Vec<ScriptState> {
+        let state = self.state.lock().await;
+        state.scripts.clone()
     }
 
     pub fn get_processes(&self) -> Arc<Mutex<HashMap<String, ManagedProcess>>> {
@@ -150,13 +166,47 @@ impl ProcessManager {
         Ok(ProcessOutput { child })
     }
 
+    async fn check_process_status(&self, name: &str) -> Result<Option<ScriptStartResult>> {
+        let mut processes = self.processes.lock().await;
+
+        if let Some(process) = processes.get_mut(name) {
+            match process.child.try_wait() {
+                Ok(Some(status)) => {
+                    processes.remove(name);
+                    tracing::debug!(
+                        script = %name,
+                        exit_status = ?status,
+                        "Previous process has finished, starting new instance"
+                    );
+                    Ok(None)
+                },
+                Ok(None) => {
+                    tracing::info!(script = %name, "Script is still running - skipping execution");
+                    Ok(Some(ScriptStartResult::AlreadyRunning))
+                },
+                Err(e) => {
+                    tracing::error!(
+                        script = %name,
+                        error = ?e,
+                        "Error checking process status"
+                    );
+                    processes.remove(name);
+                    Err(Error::Process(format!("Error checking process status: {}", e)))
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn start_script(
         &self,
         name: String,
         command: String,
         restart_policy: RestartPolicy,
         max_restarts: u32,
-    ) -> Result<()> {
+        cron: Option<String>,
+    ) -> Result<ScriptStartResult> {
         tracing::info!(
             script = %name,
             command = %command,
@@ -165,12 +215,8 @@ impl ProcessManager {
             "Starting script"
         );
 
-        {
-            let processes = self.processes.lock().await;
-            if processes.contains_key(&name) {
-                tracing::info!(script = %name, "Script is already running");
-                return Ok(());
-            }
+        if let Some(result) = self.check_process_status(&name).await? {
+            return Ok(result);
         }
 
         let log_path = log_monitor::get_log_path(&name);
@@ -184,6 +230,7 @@ impl ProcessManager {
             log_file: log_path,
             restart_policy,
             max_restarts,
+            cron: cron.clone(),
         };
 
         {
@@ -191,15 +238,22 @@ impl ProcessManager {
             processes.insert(name.clone(), managed_process);
         }
 
-        self.update_script_state(&name, ScriptStatus::Running, false)
+        self.update_script_state(&name, ScriptStatus::Running, false, cron)
             .await?;
         tracing::info!(script = %name, "Script started successfully");
-        Ok(())
+        Ok(ScriptStartResult::Started)
     }
 
     pub async fn stop_script(&self, name: &str) -> Result<()> {
+        let state = self.state.lock().await;
+        let script = state
+            .scripts
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| Error::Process(format!("Script {} not found", name)))?;
+
         tracing::info!(script = %name, "Stopping script");
-        self.update_script_state(name, ScriptStatus::Stopped, true)
+        self.update_script_state(name, ScriptStatus::Stopped, true, script.cron.clone())
             .await?;
 
         let process_opt = {
