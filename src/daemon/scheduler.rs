@@ -13,7 +13,6 @@ use tokio::time::{sleep_until, Duration, Instant};
 
 #[derive(Debug)]
 pub enum SchedulerMessage {
-    ScriptAdded(String),
     ScriptRemoved(String),
     ScriptUpdated(String),
 }
@@ -115,7 +114,7 @@ impl CronScheduler {
                 Some(msg) = self.message_rx.recv() => {
                     tracing::debug!(?msg, "Received scheduler message");
                     match msg {
-                        SchedulerMessage::ScriptAdded(name) | SchedulerMessage::ScriptUpdated(name) => {
+                        SchedulerMessage::ScriptUpdated(name) => {
                             let state = self.process_manager.get_state().await;
                             if let Some(script) = state.iter().find(|s| s.name == name && s.cron.is_some()) {
                                 if let Some(handle) = script_tasks.remove(&name) {
