@@ -1,20 +1,20 @@
-use chrono::{DateTime, Local};
-use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::Arc;
-use tokio::io::BufReader;
-use tokio::process::{Child, Command};
-use tokio::sync::mpsc::Sender;
-use tokio::sync::Mutex;
-
 use crate::common::config::RestartPolicy;
 use crate::common::error::{Error, Result};
 use crate::common::ipc::{ProcessInfo, ProcessStatus};
 use crate::daemon::log_monitor;
 use crate::daemon::scheduler::{get_scheduler_tx, SchedulerMessage};
 use crate::daemon::state::{RunningState, ScriptState, ScriptStatus};
+use chrono::{DateTime, Local};
+use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::BufReader;
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 struct ProcessOutput {
     child: Child,
@@ -267,15 +267,19 @@ impl ProcessManager {
     }
 
     pub async fn stop_script(&self, name: &str) -> Result<()> {
-        let state = self.state.lock().await;
-        let script = state
-            .scripts
-            .iter()
-            .find(|s| s.name == name)
-            .ok_or_else(|| Error::Process(format!("Script {} not found", name)))?;
-
         tracing::info!(script = %name, "Stopping script");
-        self.update_script_state(name, ScriptStatus::Stopped, true, script.cron.clone())
+
+        let cron = {
+            let state = self.state.lock().await;
+            state
+                .scripts
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.cron.clone())
+                .ok_or_else(|| Error::Process(format!("Script {} not found", name)))?
+        };
+
+        self.update_script_state(name, ScriptStatus::Stopped, true, cron)
             .await?;
 
         let process_opt = {
@@ -284,11 +288,24 @@ impl ProcessManager {
         };
 
         if let Some(mut process) = process_opt {
-            process.child.kill().await?;
-            tracing::debug!(script = %name, "Process killed");
-        } else {
-            tracing::error!(script = %name, "Script not found");
-            return Err(Error::Process(format!("Script {} not found", name)));
+            match process.child.try_wait() {
+                Ok(Some(_)) => {
+                    tracing::debug!(script = %name, "Process already finished");
+                }
+                Ok(None) => match timeout(Duration::from_secs(5), process.child.kill()).await {
+                    Ok(kill_result) => {
+                        kill_result?;
+                        tracing::debug!(script = %name, "Process killed");
+                    }
+                    Err(_) => {
+                        tracing::warn!(script = %name, "Kill operation timed out, forcing kill");
+                        process.child.start_kill()?;
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(script = %name, error = ?e, "Error checking process status");
+                }
+            }
         }
 
         tracing::info!(script = %name, "Script stopped successfully");

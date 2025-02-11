@@ -1,6 +1,6 @@
 use crate::common::config::RestartPolicy;
 use crate::common::error::Result;
-use crate::daemon::process::{ManagedProcess, ScriptStartResult};
+use crate::daemon::process_manager::{ManagedProcess, ScriptStartResult};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -18,7 +18,13 @@ pub enum ProcessExitStatus {
 pub async fn should_restart(
     processes: &Arc<Mutex<HashMap<String, ManagedProcess>>>,
     name: &str,
-) -> Option<(String, RestartPolicy, u32, ProcessExitStatus, Option<String>)> {
+) -> Option<(
+    String,
+    RestartPolicy,
+    u32,
+    ProcessExitStatus,
+    Option<String>,
+)> {
     let mut processes_guard = processes.lock().await;
     if let Some(process) = processes_guard.get_mut(name) {
         if let Ok(Some(status)) = process.child.try_wait() {
@@ -32,21 +38,22 @@ pub async fn should_restart(
 
             match (exit_status, &process.restart_policy) {
                 (ProcessExitStatus::Error(_), RestartPolicy::Always)
-                    if process.restart_count < process.max_restarts => {
-                        process.restart_count += 1;
-                        tracing::info!(
+                    if process.restart_count < process.max_restarts =>
+                {
+                    process.restart_count += 1;
+                    tracing::info!(
                         script = %name,
                         restart_count = process.restart_count,
                         max_restarts = process.max_restarts,
                         "Process failed - initiating restart"
                     );
-                        return Some((
-                            process.command.clone(),
-                            process.restart_policy.clone(),
-                            process.max_restarts,
-                            exit_status.clone(),
-                            process.cron.clone(),
-                        ));
+                    return Some((
+                        process.command.clone(),
+                        process.restart_policy.clone(),
+                        process.max_restarts,
+                        exit_status.clone(),
+                        process.cron.clone(),
+                    ));
                 }
                 (ProcessExitStatus::Success, _) => {}
                 (ProcessExitStatus::Error(code), _) => {
@@ -72,10 +79,15 @@ pub async fn check_and_restart_if_needed<F, Fut>(
     name: &str,
     restart_handler: Arc<F>,
 ) where
-    F: Fn(String, String, RestartPolicy, u32, ProcessExitStatus, Option<String>) -> Fut + Send + Sync + 'static,
+    F: Fn(String, String, RestartPolicy, u32, ProcessExitStatus, Option<String>) -> Fut
+        + Send
+        + Sync
+        + 'static,
     Fut: Future<Output = Result<ScriptStartResult>> + Send,
 {
-    if let Some((command, policy, max_restarts, exit_status, cron)) = should_restart(&processes, name).await {
+    if let Some((command, policy, max_restarts, exit_status, cron)) =
+        should_restart(&processes, name).await
+    {
         match exit_status {
             ProcessExitStatus::Error(code) => {
                 tracing::warn!(
@@ -83,7 +95,16 @@ pub async fn check_and_restart_if_needed<F, Fut>(
                     exit_code = code,
                     "Attempting to restart failed process"
                 );
-                if let Err(e) = restart_handler(name.to_string(), command, policy, max_restarts, exit_status, cron).await {
+                if let Err(e) = restart_handler(
+                    name.to_string(),
+                    command,
+                    policy,
+                    max_restarts,
+                    exit_status,
+                    cron,
+                )
+                .await
+                {
                     tracing::error!(
                         script = %name,
                         error = ?e,
@@ -106,7 +127,10 @@ pub async fn monitor_and_restart<F, Fut>(
     processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
     restart_handler: Arc<F>,
 ) where
-    F: Fn(String, String, RestartPolicy, u32, ProcessExitStatus, Option<String>) -> Fut + Send + Sync + 'static,
+    F: Fn(String, String, RestartPolicy, u32, ProcessExitStatus, Option<String>) -> Fut
+        + Send
+        + Sync
+        + 'static,
     Fut: Future<Output = Result<ScriptStartResult>> + Send,
 {
     tracing::info!("Starting process monitor");

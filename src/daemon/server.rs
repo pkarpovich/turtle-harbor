@@ -1,6 +1,6 @@
 use crate::common::error::Result;
 use crate::common::ipc::{self, Command, Profile, Response};
-use crate::daemon::process::ProcessManager;
+use crate::daemon::process_manager::ProcessManager;
 use crate::daemon::process_monitor;
 use crate::daemon::scheduler::{init_scheduler_tx, CronScheduler};
 use std::path::{Path, PathBuf};
