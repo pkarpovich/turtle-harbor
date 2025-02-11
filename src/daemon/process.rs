@@ -13,7 +13,7 @@ use crate::common::config::RestartPolicy;
 use crate::common::error::{Error, Result};
 use crate::common::ipc::{ProcessInfo, ProcessStatus};
 use crate::daemon::log_monitor;
-use crate::daemon::scheduler::SchedulerMessage;
+use crate::daemon::scheduler::{get_scheduler_tx, SchedulerMessage};
 use crate::daemon::state::{RunningState, ScriptState, ScriptStatus};
 
 struct ProcessOutput {
@@ -34,7 +34,6 @@ pub struct ManagedProcess {
 
 pub struct ProcessManager {
     pub processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
-    pub scheduler_tx: Option<Sender<SchedulerMessage>>,
     pub state: Arc<Mutex<RunningState>>,
 }
 
@@ -61,7 +60,6 @@ impl ProcessManager {
         Ok(Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
             state: Arc::new(Mutex::new(state)),
-            scheduler_tx: None,
         })
     }
 
@@ -140,16 +138,16 @@ impl ProcessManager {
         Arc::clone(&self.processes)
     }
 
-    pub fn set_scheduler_tx(&mut self, tx: Sender<SchedulerMessage>) {
-        tracing::debug!("Setting scheduler tx");
-        self.scheduler_tx = Some(tx);
-    }
-
     async fn notify_scheduler(&self, msg: SchedulerMessage) {
-        if let Some(tx) = &self.scheduler_tx {
-            tracing::debug!(message = ?msg, "Notifying scheduler");
-            if let Err(e) = tx.send(msg).await {
-                tracing::error!(error = ?e, "Failed to notify scheduler");
+        match get_scheduler_tx() {
+            Some(tx) => {
+                tracing::debug!(message = ?msg, "Notifying scheduler");
+                if let Err(e) = tx.send(msg).await {
+                    tracing::error!(error = ?e, "Failed to notify scheduler");
+                }
+            }
+            None => {
+                tracing::error!("Scheduler tx is None, notification skipped");
             }
         }
     }
@@ -385,5 +383,14 @@ impl ProcessManager {
             all_logs.push_str(&log_content);
         }
         Ok(all_logs)
+    }
+}
+
+impl Clone for ProcessManager {
+    fn clone(&self) -> Self {
+        Self {
+            processes: Arc::clone(&self.processes),
+            state: Arc::clone(&self.state),
+        }
     }
 }

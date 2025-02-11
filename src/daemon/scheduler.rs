@@ -3,6 +3,7 @@ use crate::daemon::process::ProcessManager;
 use crate::daemon::state::ScriptState;
 use chrono::Local;
 use cron::Schedule;
+use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -20,6 +21,18 @@ pub enum SchedulerMessage {
 pub struct CronScheduler {
     process_manager: Arc<ProcessManager>,
     message_rx: Receiver<SchedulerMessage>,
+}
+
+static SCHEDULER_TX: OnceCell<Sender<SchedulerMessage>> = OnceCell::new();
+
+pub fn init_scheduler_tx(tx: Sender<SchedulerMessage>) {
+    SCHEDULER_TX
+        .set(tx)
+        .expect("Scheduler TX already initialized");
+}
+
+pub fn get_scheduler_tx() -> Option<&'static Sender<SchedulerMessage>> {
+    SCHEDULER_TX.get()
 }
 
 impl CronScheduler {

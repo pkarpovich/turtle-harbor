@@ -2,7 +2,7 @@ use crate::common::error::Result;
 use crate::common::ipc::{self, Command, Profile, Response};
 use crate::daemon::process::ProcessManager;
 use crate::daemon::process_monitor;
-use crate::daemon::scheduler::CronScheduler;
+use crate::daemon::scheduler::{init_scheduler_tx, CronScheduler};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -144,8 +144,7 @@ impl Server {
         let process_manager = Arc::clone(&self.process_manager);
         let (mut scheduler, scheduler_tx) = CronScheduler::new(process_manager);
 
-        let mut pm = self.process_manager.as_ref().clone();
-        pm.set_scheduler_tx(scheduler_tx);
+        init_scheduler_tx(scheduler_tx);
 
         tokio::spawn(async move {
             if let Err(e) = scheduler.start().await {
@@ -217,15 +216,5 @@ impl Server {
         }
         tracing::info!("Shutdown complete");
         Ok(())
-    }
-}
-
-impl Clone for ProcessManager {
-    fn clone(&self) -> Self {
-        Self {
-            processes: Arc::clone(&self.processes),
-            state: Arc::clone(&self.state),
-            scheduler_tx: self.scheduler_tx.clone(),
-        }
     }
 }
