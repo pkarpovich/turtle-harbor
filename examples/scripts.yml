@@ -3,7 +3,7 @@ settings:
 
 scripts:
   backend:
-    command: "./test.sh"
+    command: "./test_script.sh"
     restart_policy: "always"
     max_restarts: 5
     cron: "0 */1 * * * * *"
