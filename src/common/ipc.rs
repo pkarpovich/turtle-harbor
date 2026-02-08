@@ -85,11 +85,20 @@ async fn send_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Res
     Ok(())
 }
 
+const MAX_MESSAGE_SIZE: u32 = 10 * 1024 * 1024;
+
 async fn receive_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await?;
     let len = u32::from_le_bytes(len_bytes);
     tracing::trace!(message_len = len, "Receiving message");
+
+    if len > MAX_MESSAGE_SIZE {
+        return Err(crate::common::error::Error::Ipc(format!(
+            "Message size {} exceeds maximum {}",
+            len, MAX_MESSAGE_SIZE
+        )));
+    }
 
     let mut buffer = vec![0u8; len as usize];
     stream.read_exact(&mut buffer).await?;

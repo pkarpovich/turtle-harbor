@@ -28,6 +28,7 @@ pub struct ManagedProcess {
     pub cron: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ProcessManager {
     pub processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
     pub state: Arc<Mutex<RunningState>>,
@@ -403,12 +404,3 @@ impl ProcessManager {
     }
 }
 
-impl Clone for ProcessManager {
-    fn clone(&self) -> Self {
-        Self {
-            processes: Arc::clone(&self.processes),
-            state: Arc::clone(&self.state),
-            log_dir: self.log_dir.clone(),
-        }
-    }
-}

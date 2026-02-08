@@ -32,7 +32,7 @@ pub enum RestartPolicy {
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(&path).map_err(|e| Error::Config(e.to_string()))?;
-        let config = serde_yaml::from_str(&content).map_err(|e| Error::Config(e.to_string()))?;
+        let config = serde_yml::from_str(&content).map_err(|e| Error::Config(e.to_string()))?;
         Ok(config)
     }
 }

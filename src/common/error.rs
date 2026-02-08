@@ -17,9 +17,6 @@ pub enum Error {
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("YAML deserialization error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
-
     #[error("Other error: {0}")]
     Other(String),
 }

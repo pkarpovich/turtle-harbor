@@ -31,16 +31,8 @@ impl Server {
         };
 
         tracing::info!(state_file = ?state_file, ?log_dir, "Using state file");
-        let process_manager = match ProcessManager::new(state_file, log_dir) {
-            Ok(pm) => {
-                tracing::info!("Process manager initialized successfully");
-                pm
-            }
-            Err(e) => {
-                tracing::error!(error = ?e, "Failed to initialize process manager");
-                return Err(e);
-            }
-        };
+        let process_manager = ProcessManager::new(state_file, log_dir)?;
+        tracing::info!("Process manager initialized successfully");
 
         Ok(Self {
             socket_path: PathBuf::from(ipc::get_socket_path()),
@@ -161,31 +153,13 @@ impl Server {
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Starting server initialization");
 
-        match self.process_manager.restore_state().await {
-            Ok(_) => tracing::info!("State restored successfully"),
-            Err(e) => {
-                tracing::error!(error = ?e, "Failed to restore state");
-                return Err(e);
-            }
-        }
+        self.process_manager.restore_state().await?;
+        tracing::info!("State restored successfully");
 
-        tracing::info!("Setting up socket listener");
-        let listener = match self.setup_listener().await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(error = ?e, "Failed to setup listener");
-                return Err(e);
-            }
-        };
+        let listener = self.setup_listener().await?;
+        tracing::info!("Socket listener ready");
 
-        tracing::info!("Setting up signal handlers");
-        let (mut sigterm, mut sigint) = match Self::setup_signal_handlers().await {
-            Ok(handlers) => handlers,
-            Err(e) => {
-                tracing::error!(error = ?e, "Failed to setup signal handlers");
-                return Err(e);
-            }
-        };
+        let (mut sigterm, mut sigint) = Self::setup_signal_handlers().await?;
 
         tracing::info!("Starting process monitor");
         self.start_process_monitor().await;

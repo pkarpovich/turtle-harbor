@@ -13,7 +13,6 @@ pub fn handle_error(error: Error) -> ! {
         Error::Process(msg) => format!("Process error: {}", msg),
         Error::Config(msg) => format!("Configuration error: {}", msg),
         Error::Json(e) => format!("JSON error: {}", e),
-        Error::Yaml(e) => format!("YAML error: {}", e),
         Error::Io(e) => format!("IO error: {}", e),
         Error::Other(msg) => msg.to_string(),
     };
