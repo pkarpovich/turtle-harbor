@@ -3,7 +3,7 @@ use crate::common::error::{Error, Result};
 use crate::common::ipc::{ProcessInfo, ProcessStatus};
 use crate::daemon::log_monitor;
 use crate::daemon::scheduler::{get_scheduler_tx, SchedulerMessage};
-use crate::daemon::state::{RunningState, ScriptState, ScriptStatus};
+use crate::daemon::state::{RunningState, ScriptState};
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -15,10 +15,6 @@ use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-
-struct ProcessOutput {
-    child: Child,
-}
 
 pub struct ManagedProcess {
     pub child: Child,
@@ -48,10 +44,7 @@ pub enum ScriptStartResult {
 impl ProcessManager {
     pub fn new(state_file: PathBuf, log_dir: PathBuf) -> Result<Self> {
         tracing::info!(state_file = ?state_file, ?log_dir, "Creating new ProcessManager");
-        let state = RunningState::load(&state_file).map_err(|e| {
-            tracing::error!(error = ?e, "Failed to load state");
-            Error::Process(format!("Failed to load state: {}", e))
-        })?;
+        let state = RunningState::load(&state_file)?;
 
         tracing::info!(
             scripts_count = state.scripts.len(),
@@ -73,7 +66,7 @@ impl ProcessManager {
         };
 
         for script in scripts_to_restore.into_iter() {
-            if matches!(script.status, ScriptStatus::Running) && !script.explicitly_stopped {
+            if matches!(script.status, ProcessStatus::Running) && !script.explicitly_stopped {
                 tracing::info!(script = %script.name, "Restoring script");
                 self.start_script(
                     script.name,
@@ -92,7 +85,7 @@ impl ProcessManager {
     async fn update_script_state(
         &self,
         name: &str,
-        status: ScriptStatus,
+        status: ProcessStatus,
         explicitly_stopped: bool,
         cron: Option<String>,
     ) -> Result<()> {
@@ -111,7 +104,7 @@ impl ProcessManager {
                 max_restarts: proc.max_restarts,
                 status: status.clone(),
                 last_started: proc.start_time,
-                last_stopped: if matches!(status, ScriptStatus::Stopped | ScriptStatus::Failed) {
+                last_stopped: if matches!(status, ProcessStatus::Stopped | ProcessStatus::Failed) {
                     Some(Local::now())
                 } else {
                     None
@@ -123,9 +116,7 @@ impl ProcessManager {
         };
 
         let mut state = self.state.lock().await;
-        state
-            .update_script(script_state)
-            .map_err(|e| Error::Process(format!("Failed to update state: {}", e)))?;
+        state.update_script(script_state)?;
 
         tracing::debug!(script = %name, "State updated successfully");
         Ok(())
@@ -154,7 +145,7 @@ impl ProcessManager {
         }
     }
 
-    async fn setup_process_output(command: &str, log_path: &PathBuf, log_dir: &Path) -> Result<ProcessOutput> {
+    async fn setup_process_output(command: &str, log_path: &PathBuf, log_dir: &Path) -> Result<Child> {
         tracing::debug!(command = %command, path = ?log_path, "Setting up process output");
         log_monitor::ensure_log_dir(log_dir)?;
 
@@ -181,7 +172,7 @@ impl ProcessManager {
         }
 
         tracing::debug!("Process output setup completed");
-        Ok(ProcessOutput { child })
+        Ok(child)
     }
 
     async fn check_process_status(&self, name: &str) -> Result<Option<ScriptStartResult>> {
@@ -241,9 +232,9 @@ impl ProcessManager {
         }
 
         let log_path = log_monitor::get_log_path(&self.log_dir, &name);
-        let output = Self::setup_process_output(&command, &log_path, &self.log_dir).await?;
+        let child = Self::setup_process_output(&command, &log_path, &self.log_dir).await?;
         let managed_process = ManagedProcess {
-            child: output.child,
+            child,
             command: command.clone(),
             status: ProcessStatus::Running,
             start_time: Some(Local::now()),
@@ -259,7 +250,7 @@ impl ProcessManager {
             processes.insert(name.clone(), managed_process);
         }
 
-        self.update_script_state(&name, ScriptStatus::Running, false, cron)
+        self.update_script_state(&name, ProcessStatus::Running, false, cron)
             .await?;
         tracing::info!(script = %name, "Script started successfully");
         self.notify_scheduler(SchedulerMessage::ScriptUpdated(name.clone()))
@@ -281,7 +272,7 @@ impl ProcessManager {
                 .ok_or_else(|| Error::Process(format!("Script {} not found", name)))?
         };
 
-        self.update_script_state(name, ScriptStatus::Stopped, true, cron)
+        self.update_script_state(name, ProcessStatus::Stopped, true, cron)
             .await?;
 
         let process_opt = {
@@ -389,10 +380,17 @@ impl ProcessManager {
     }
 
     pub async fn read_all_logs(&self) -> Result<String> {
-        let processes = self.processes.lock().await;
+        let log_files: Vec<(String, PathBuf)> = {
+            let processes = self.processes.lock().await;
+            processes
+                .iter()
+                .map(|(name, process)| (name.clone(), process.log_file.clone()))
+                .collect()
+        };
+
         let mut all_logs = String::new();
-        for (name, process) in processes.iter() {
-            let log_content = match tokio::fs::read_to_string(&process.log_file).await {
+        for (name, log_file) in &log_files {
+            let log_content = match tokio::fs::read_to_string(log_file).await {
                 Ok(logs) => format!("\n=== Logs for {} ===\n{}", name, logs),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     format!("\n=== No logs for {} ===\n", name)

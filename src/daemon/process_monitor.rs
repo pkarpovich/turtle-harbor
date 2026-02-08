@@ -18,13 +18,7 @@ pub enum ProcessExitStatus {
 pub async fn should_restart(
     processes: &Arc<Mutex<HashMap<String, ManagedProcess>>>,
     name: &str,
-) -> Option<(
-    String,
-    RestartPolicy,
-    u32,
-    ProcessExitStatus,
-    Option<String>,
-)> {
+) -> Option<(String, RestartPolicy, u32, ProcessExitStatus, Option<String>)> {
     let mut processes_guard = processes.lock().await;
     if let Some(process) = processes_guard.get_mut(name) {
         if let Ok(Some(status)) = process.child.try_wait() {
@@ -79,10 +73,7 @@ pub async fn check_and_restart_if_needed<F, Fut>(
     name: &str,
     restart_handler: Arc<F>,
 ) where
-    F: Fn(String, String, RestartPolicy, u32, ProcessExitStatus, Option<String>) -> Fut
-        + Send
-        + Sync
-        + 'static,
+    F: Fn(String, String, RestartPolicy, u32, Option<String>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<ScriptStartResult>> + Send,
 {
     if let Some((command, policy, max_restarts, exit_status, cron)) =
@@ -100,7 +91,6 @@ pub async fn check_and_restart_if_needed<F, Fut>(
                     command,
                     policy,
                     max_restarts,
-                    exit_status,
                     cron,
                 )
                 .await
@@ -127,10 +117,7 @@ pub async fn monitor_and_restart<F, Fut>(
     processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
     restart_handler: Arc<F>,
 ) where
-    F: Fn(String, String, RestartPolicy, u32, ProcessExitStatus, Option<String>) -> Fut
-        + Send
-        + Sync
-        + 'static,
+    F: Fn(String, String, RestartPolicy, u32, Option<String>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<ScriptStartResult>> + Send,
 {
     tracing::info!("Starting process monitor");

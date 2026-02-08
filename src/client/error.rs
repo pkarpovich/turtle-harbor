@@ -4,7 +4,10 @@ use std::process;
 pub fn handle_error(error: Error) -> ! {
     let message = match &error {
         Error::Ipc(msg) => format!("Daemon error: {}", msg),
-        Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Error::Io(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::ConnectionRefused =>
+        {
             "Daemon is not running. Please start turtled first".to_string()
         }
         Error::Process(msg) => format!("Process error: {}", msg),

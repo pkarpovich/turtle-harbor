@@ -3,13 +3,13 @@ use crate::common::ipc::{self, Command, Profile, Response};
 use crate::daemon::process_manager::ProcessManager;
 use crate::daemon::process_monitor;
 use crate::daemon::scheduler::{init_scheduler_tx, CronScheduler};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
 
 pub struct Server {
-    socket_path: String,
+    socket_path: PathBuf,
     process_manager: Arc<ProcessManager>,
 }
 
@@ -43,7 +43,7 @@ impl Server {
         };
 
         Ok(Self {
-            socket_path: ipc::get_socket_path().to_string(),
+            socket_path: PathBuf::from(ipc::get_socket_path()),
             process_manager: Arc::new(process_manager),
         })
     }
@@ -108,7 +108,7 @@ impl Server {
     }
 
     async fn setup_listener(&self) -> Result<UnixListener> {
-        if Path::new(&self.socket_path).exists() {
+        if self.socket_path.exists() {
             tracing::info!(path = ?self.socket_path, "Removing existing socket file");
             std::fs::remove_file(&self.socket_path)?;
         }
@@ -131,7 +131,7 @@ impl Server {
         let processes = self.process_manager.get_processes();
         let pm = Arc::clone(&self.process_manager);
 
-        let restart_handler = Arc::new(move |name, command, policy, max_restarts, _, cron| {
+        let restart_handler = Arc::new(move |name, command, policy, max_restarts, cron| {
             let pm = Arc::clone(&pm);
             async move {
                 pm.start_script(name, command, policy, max_restarts, cron)
@@ -215,7 +215,7 @@ impl Server {
         tracing::info!("Shutting down processes");
         self.process_manager.shutdown().await?;
 
-        if Path::new(&self.socket_path).exists() {
+        if self.socket_path.exists() {
             tracing::info!("Removing socket file");
             std::fs::remove_file(&self.socket_path)?;
         }

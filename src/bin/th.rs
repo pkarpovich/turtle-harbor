@@ -17,7 +17,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
     #[arg(short, long, default_value = "scripts.yml")]
-    pub config: String,
+    pub config: PathBuf,
 }
 
 #[derive(Subcommand)]
