@@ -1,7 +1,7 @@
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use tracing_appender::rolling;
+use std::io::IsTerminal;
 use tracing_appender::non_blocking::WorkerGuard;
-use atty;
+use tracing_appender::rolling;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub fn init_logging() -> WorkerGuard {
     let filter = EnvFilter::try_from_default_env()
@@ -14,7 +14,7 @@ pub fn init_logging() -> WorkerGuard {
         .with_thread_names(true)
         .with_file(true)
         .with_line_number(true)
-        .with_ansi(atty::is(atty::Stream::Stdout))
+        .with_ansi(std::io::stdout().is_terminal())
         .with_level(true)
         .with_timer(fmt::time::UtcTime::rfc_3339())
         .pretty();

@@ -25,8 +25,13 @@ impl Server {
             }
         };
 
-        tracing::info!(state_file = ?state_file, "Using state file");
-        let process_manager = match ProcessManager::new(state_file) {
+        let log_dir = match Profile::current() {
+            Profile::Development => PathBuf::from("logs"),
+            Profile::Production => PathBuf::from(format!("{}/log/turtle-harbor", brew_var)),
+        };
+
+        tracing::info!(state_file = ?state_file, ?log_dir, "Using state file");
+        let process_manager = match ProcessManager::new(state_file, log_dir) {
             Ok(pm) => {
                 tracing::info!("Process manager initialized successfully");
                 pm

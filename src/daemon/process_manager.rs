@@ -7,7 +7,7 @@ use crate::daemon::state::{RunningState, ScriptState, ScriptStatus};
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +35,7 @@ pub struct ManagedProcess {
 pub struct ProcessManager {
     pub processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
     pub state: Arc<Mutex<RunningState>>,
+    pub log_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -45,8 +46,8 @@ pub enum ScriptStartResult {
 }
 
 impl ProcessManager {
-    pub fn new(state_file: PathBuf) -> Result<Self> {
-        tracing::info!(state_file = ?state_file, "Creating new ProcessManager");
+    pub fn new(state_file: PathBuf, log_dir: PathBuf) -> Result<Self> {
+        tracing::info!(state_file = ?state_file, ?log_dir, "Creating new ProcessManager");
         let state = RunningState::load(&state_file).map_err(|e| {
             tracing::error!(error = ?e, "Failed to load state");
             Error::Process(format!("Failed to load state: {}", e))
@@ -60,6 +61,7 @@ impl ProcessManager {
         Ok(Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
             state: Arc::new(Mutex::new(state)),
+            log_dir,
         })
     }
 
@@ -152,9 +154,9 @@ impl ProcessManager {
         }
     }
 
-    async fn setup_process_output(command: &str, log_path: &PathBuf) -> Result<ProcessOutput> {
+    async fn setup_process_output(command: &str, log_path: &PathBuf, log_dir: &Path) -> Result<ProcessOutput> {
         tracing::debug!(command = %command, path = ?log_path, "Setting up process output");
-        log_monitor::ensure_log_dir()?;
+        log_monitor::ensure_log_dir(log_dir)?;
 
         let file = OpenOptions::new()
             .create(true)
@@ -238,8 +240,8 @@ impl ProcessManager {
             return Ok(result);
         }
 
-        let log_path = log_monitor::get_log_path(&name);
-        let output = Self::setup_process_output(&command, &log_path).await?;
+        let log_path = log_monitor::get_log_path(&self.log_dir, &name);
+        let output = Self::setup_process_output(&command, &log_path, &self.log_dir).await?;
         let managed_process = ManagedProcess {
             child: output.child,
             command: command.clone(),
@@ -364,8 +366,8 @@ impl ProcessManager {
     }
 
     pub async fn read_logs(&self, name: &str) -> Result<String> {
-        log_monitor::ensure_log_dir()?;
-        let log_path = log_monitor::get_log_path(name);
+        log_monitor::ensure_log_dir(&self.log_dir)?;
+        let log_path = log_monitor::get_log_path(&self.log_dir, name);
 
         if !log_path.exists() {
             return Ok("No logs available yet.".to_string());
@@ -408,6 +410,7 @@ impl Clone for ProcessManager {
         Self {
             processes: Arc::clone(&self.processes),
             state: Arc::clone(&self.state),
+            log_dir: self.log_dir.clone(),
         }
     }
 }

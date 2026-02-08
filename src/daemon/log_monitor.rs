@@ -1,6 +1,6 @@
 use chrono::Local;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
@@ -34,8 +34,7 @@ where
     });
 }
 
-pub fn ensure_log_dir() -> Result<()> {
-    let log_dir = PathBuf::from("logs");
+pub fn ensure_log_dir(log_dir: &Path) -> Result<()> {
     if !log_dir.exists() {
         tracing::debug!(path = ?log_dir, "Creating log directory");
         std::fs::create_dir_all(&log_dir)?;
@@ -43,8 +42,8 @@ pub fn ensure_log_dir() -> Result<()> {
     Ok(())
 }
 
-pub fn get_log_path(name: &str) -> PathBuf {
-    let path = PathBuf::from("logs").join(format!("{}.log", name));
+pub fn get_log_path(log_dir: &Path, name: &str) -> PathBuf {
+    let path = log_dir.join(format!("{}.log", name));
     tracing::trace!(script = %name, path = ?path, "Generated log path");
     path
 }

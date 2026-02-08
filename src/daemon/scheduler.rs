@@ -3,10 +3,9 @@ use crate::daemon::process_manager::ProcessManager;
 use crate::daemon::state::ScriptState;
 use chrono::Local;
 use cron::Schedule;
-use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Duration, Instant};
@@ -22,7 +21,7 @@ pub struct CronScheduler {
     message_rx: Receiver<SchedulerMessage>,
 }
 
-static SCHEDULER_TX: OnceCell<Sender<SchedulerMessage>> = OnceCell::new();
+static SCHEDULER_TX: OnceLock<Sender<SchedulerMessage>> = OnceLock::new();
 
 pub fn init_scheduler_tx(tx: Sender<SchedulerMessage>) {
     SCHEDULER_TX
@@ -32,6 +31,64 @@ pub fn init_scheduler_tx(tx: Sender<SchedulerMessage>) {
 
 pub fn get_scheduler_tx() -> Option<&'static Sender<SchedulerMessage>> {
     SCHEDULER_TX.get()
+}
+
+async fn run_scheduled_script(pm: &ProcessManager, state: &ScriptState) -> Result<()> {
+    let cron_expr = state.cron.as_ref().ok_or_else(|| {
+        Error::Process(format!("No cron expression found for script {}", state.name))
+    })?;
+
+    let schedule = Schedule::from_str(cron_expr).map_err(|e| {
+        Error::Process(format!(
+            "Invalid cron expression for script {}: {}",
+            state.name, e
+        ))
+    })?;
+
+    let next_time = match schedule.upcoming(Local).next() {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    let now = Local::now();
+    if next_time <= now {
+        return Ok(());
+    }
+
+    let duration = next_time
+        .signed_duration_since(now)
+        .to_std()
+        .unwrap_or(Duration::from_secs(0));
+
+    sleep_until(Instant::now() + duration).await;
+
+    match pm
+        .start_script(
+            state.name.clone(),
+            state.command.clone(),
+            state.restart_policy.clone(),
+            state.max_restarts,
+            state.cron.clone(),
+        )
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                script = %state.name,
+                next_run = %schedule.upcoming(Local).next().unwrap().format("%Y-%m-%d %H:%M:%S"),
+                "Successfully started scheduled script"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                script = %state.name,
+                error = ?e,
+                "Failed to start scheduled script"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 impl CronScheduler {
@@ -44,64 +101,6 @@ impl CronScheduler {
             },
             tx,
         )
-    }
-
-    async fn handle_script(&self, state: &ScriptState) -> Result<()> {
-        let pm = Arc::clone(&self.process_manager);
-        let name = state.name.clone();
-        let command = state.command.clone();
-        let restart_policy = state.restart_policy.clone();
-        let max_restarts = state.max_restarts;
-        let cron_expr = state.cron.clone().ok_or_else(|| {
-            Error::Process(format!("No cron expression found for script {}", name))
-        })?;
-
-        let schedule = Schedule::from_str(&cron_expr).map_err(|e| {
-            Error::Process(format!(
-                "Invalid cron expression for script {}: {}",
-                name, e
-            ))
-        })?;
-
-        if let Some(next_time) = schedule.upcoming(Local).next() {
-            let now = Local::now();
-            if next_time > now {
-                let duration = next_time
-                    .signed_duration_since(now)
-                    .to_std()
-                    .unwrap_or(Duration::from_secs(0));
-
-                sleep_until(Instant::now() + duration).await;
-
-                match pm
-                    .start_script(
-                        name.clone(),
-                        command,
-                        restart_policy,
-                        max_restarts,
-                        Some(cron_expr.clone()),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        tracing::info!(
-                            script = %name,
-                            next_run = %schedule.upcoming(Local).next().unwrap().format("%Y-%m-%d %H:%M:%S"),
-                            "Successfully started scheduled script"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            script = %name,
-                            error = ?e,
-                            "Failed to start scheduled script"
-                        );
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     pub async fn start(&mut self) -> Result<()> {
@@ -121,11 +120,11 @@ impl CronScheduler {
                                     handle.abort();
                                 }
 
-                                let scheduler = Arc::new(self.clone());
+                                let pm = Arc::clone(&self.process_manager);
                                 let script_state = script.clone();
                                 let handle = tokio::spawn(async move {
                                     loop {
-                                        if let Err(e) = scheduler.handle_script(&script_state).await {
+                                        if let Err(e) = run_scheduled_script(&pm, &script_state).await {
                                             tracing::error!(
                                                 script = %script_state.name,
                                                 error = ?e,
@@ -151,12 +150,3 @@ impl CronScheduler {
     }
 }
 
-impl Clone for CronScheduler {
-    fn clone(&self) -> Self {
-        let (_, rx) = mpsc::channel(100);
-        Self {
-            process_manager: Arc::clone(&self.process_manager),
-            message_rx: rx,
-        }
-    }
-}

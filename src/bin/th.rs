@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 use turtle_harbor::client::commands;
 use turtle_harbor::client::error::handle_error;
 use turtle_harbor::common::config::{Config, Script};
+use turtle_harbor::common::error::Error;
 use turtle_harbor::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
 
 #[derive(Parser)]
@@ -85,7 +86,10 @@ where
             tracing::debug!("Preparing task for script {}", name);
             execute_for_script(name, script, command_creator)
         });
-        future::join_all(tasks).await;
+        let results = future::join_all(tasks).await;
+        if let Some(err) = results.into_iter().find_map(|r| r.err()) {
+            return Err(err);
+        }
     }
     Ok(())
 }
@@ -133,8 +137,13 @@ pub async fn main() {
     let cli = Cli::parse();
 
     if let Err(e) = run(cli).await {
-        tracing::error!(?e, "Command failed");
-        handle_error(e.into());
+        match e.downcast::<Error>() {
+            Ok(err) => handle_error(err),
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
