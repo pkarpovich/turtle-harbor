@@ -1,12 +1,11 @@
 use crate::common::config::RestartPolicy;
 use crate::common::error::{Error, Result};
 use crate::common::ipc::{ProcessInfo, ProcessStatus};
-use crate::daemon::log_monitor;
+use crate::daemon::log_monitor::{self, ScriptLogger};
 use crate::daemon::scheduler::{get_scheduler_tx, SchedulerMessage};
 use crate::daemon::state::{RunningState, ScriptState};
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -26,6 +25,7 @@ pub struct ManagedProcess {
     pub restart_policy: RestartPolicy,
     pub max_restarts: u32,
     pub cron: Option<String>,
+    logger: Option<ScriptLogger>,
 }
 
 #[derive(Clone)]
@@ -146,15 +146,11 @@ impl ProcessManager {
         }
     }
 
-    async fn setup_process_output(command: &str, log_path: &PathBuf, log_dir: &Path) -> Result<Child> {
+    fn setup_process_output(command: &str, log_path: &PathBuf, log_dir: &Path) -> Result<(Child, ScriptLogger)> {
         tracing::debug!(command = %command, path = ?log_path, "Setting up process output");
         log_monitor::ensure_log_dir(log_dir)?;
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)?;
-        let file = Arc::new(Mutex::new(file));
+        let logger = ScriptLogger::new(log_path.clone())?;
 
         let mut child = Command::new("sh")
             .arg("-c")
@@ -165,15 +161,15 @@ impl ProcessManager {
 
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
-            log_monitor::spawn_log_reader(reader, file.clone()).await;
+            log_monitor::spawn_stdout_reader(reader, logger.tx.clone());
         }
         if let Some(stderr) = child.stderr.take() {
             let reader = BufReader::new(stderr);
-            log_monitor::spawn_log_reader(reader, file.clone()).await;
+            log_monitor::spawn_stderr_reader(reader, logger.tx.clone());
         }
 
         tracing::debug!("Process output setup completed");
-        Ok(child)
+        Ok((child, logger))
     }
 
     async fn check_process_status(&self, name: &str) -> Result<Option<ScriptStartResult>> {
@@ -233,7 +229,7 @@ impl ProcessManager {
         }
 
         let log_path = log_monitor::get_log_path(&self.log_dir, &name);
-        let child = Self::setup_process_output(&command, &log_path, &self.log_dir).await?;
+        let (child, logger) = Self::setup_process_output(&command, &log_path, &self.log_dir)?;
         let managed_process = ManagedProcess {
             child,
             command: command.clone(),
@@ -244,6 +240,7 @@ impl ProcessManager {
             restart_policy,
             max_restarts,
             cron: cron.clone(),
+            logger: Some(logger),
         };
 
         {
@@ -300,6 +297,9 @@ impl ProcessManager {
                     tracing::error!(script = %name, error = ?e, "Error checking process status");
                 }
             }
+            if let Some(logger) = process.logger.take() {
+                logger.shutdown();
+            }
         }
 
         tracing::info!(script = %name, "Script stopped successfully");
@@ -324,6 +324,9 @@ impl ProcessManager {
             } {
                 tracing::debug!(script = %name, "Killing process");
                 process.child.kill().await?;
+                if let Some(logger) = process.logger.take() {
+                    logger.shutdown();
+                }
             }
         }
 
