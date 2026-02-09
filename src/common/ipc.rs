@@ -94,10 +94,10 @@ async fn receive_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result
     tracing::trace!(message_len = len, "Receiving message");
 
     if len > MAX_MESSAGE_SIZE {
-        return Err(crate::common::error::Error::Ipc(format!(
-            "Message size {} exceeds maximum {}",
-            len, MAX_MESSAGE_SIZE
-        )));
+        return Err(crate::common::error::Error::MessageTooLarge {
+            size: len,
+            max: MAX_MESSAGE_SIZE,
+        });
     }
 
     let mut buffer = vec![0u8; len as usize];

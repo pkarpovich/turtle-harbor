@@ -26,5 +26,7 @@ pub fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    // SAFETY: kill with signal 0 performs an existence check without sending a signal.
+    // pid is a valid u32 from child.id(), cast to i32 is safe for valid PIDs.
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }

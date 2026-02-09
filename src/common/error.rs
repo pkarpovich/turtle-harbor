@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -5,26 +6,32 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Config error: {0}")]
-    Config(String),
+    #[error("failed to read config file {path}: {source}")]
+    ConfigRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
-    #[error("IPC error: {0}")]
-    Ipc(String),
+    #[error("failed to parse config: {0}")]
+    ConfigParse(#[from] serde_yml::Error),
 
-    #[error("Process error: {0}")]
-    Process(String),
+    #[error("message size {size} exceeds maximum {max}")]
+    MessageTooLarge { size: u32, max: u32 },
+
+    #[error("command timed out")]
+    CommandTimeout,
+
+    #[error("script '{name}' not found")]
+    ScriptNotFound { name: String },
+
+    #[error("invalid cron expression '{expression}': {source}")]
+    CronParse {
+        expression: String,
+        source: cron::error::Error,
+    },
 
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
-
-    #[error("Other error: {0}")]
-    Other(String),
-}
-
-impl From<anyhow::Error> for Error {
-    fn from(err: anyhow::Error) -> Self {
-        Error::Other(err.to_string())
-    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

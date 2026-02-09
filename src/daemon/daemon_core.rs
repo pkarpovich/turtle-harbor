@@ -235,12 +235,20 @@ impl DaemonCore {
         log_monitor::ensure_log_dir(&self.log_dir)?;
         let logger = ScriptLogger::new(log_path)?;
 
-        let mut child = TokioCommand::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = unsafe {
+            // SAFETY: setpgid(0, 0) makes the child its own process group leader.
+            // This is async-signal-safe per POSIX and safe to call in pre_exec.
+            TokioCommand::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .pre_exec(|| {
+                    libc::setpgid(0, 0);
+                    Ok(())
+                })
+                .spawn()?
+        };
 
         let pid = child.id().unwrap_or(0);
 
@@ -301,21 +309,27 @@ impl DaemonCore {
             .iter()
             .find(|s| s.name == name)
             .map(|s| s.cron.clone())
-            .ok_or_else(|| Error::Process(format!("Script {} not found", name)))?;
+            .ok_or_else(|| Error::ScriptNotFound {
+                name: name.to_string(),
+            })?;
 
         self.update_script_state(name, ProcessStatus::Stopped, true, cron)
             .await?;
 
         if let Some(mut process) = self.processes.remove(name) {
             if process.pid > 0 && is_process_alive(process.pid) {
-                unsafe { libc::kill(process.pid as i32, libc::SIGTERM) };
+                let pgid = process.pid as i32;
+                // SAFETY: killpg sends a signal to the entire process group.
+                // pgid is valid because we set setpgid(0,0) in pre_exec.
+                unsafe { libc::killpg(pgid, libc::SIGTERM) };
 
                 if let Some(watcher) = process.watcher.take() {
                     match tokio::time::timeout(Duration::from_secs(5), watcher).await {
-                        Ok(_) => tracing::debug!(script = %name, "Process exited after SIGTERM"),
+                        Ok(_) => tracing::debug!(script = %name, "Process group exited after SIGTERM"),
                         Err(_) => {
-                            tracing::warn!(script = %name, "SIGTERM timeout, sending SIGKILL");
-                            unsafe { libc::kill(process.pid as i32, libc::SIGKILL) };
+                            tracing::warn!(script = %name, "SIGTERM timeout, sending SIGKILL to process group");
+                            // SAFETY: same pgid, escalating to SIGKILL after timeout.
+                            unsafe { libc::killpg(pgid, libc::SIGKILL) };
                         }
                     }
                 }
@@ -344,11 +358,14 @@ impl DaemonCore {
                 tracing::debug!(script = %name, "Killing process");
 
                 if process.pid > 0 && is_process_alive(process.pid) {
-                    unsafe { libc::kill(process.pid as i32, libc::SIGTERM) };
+                    let pgid = process.pid as i32;
+                    // SAFETY: killpg sends SIGTERM to the entire process group.
+                    unsafe { libc::killpg(pgid, libc::SIGTERM) };
                     tokio::time::sleep(Duration::from_millis(100)).await;
 
                     if is_process_alive(process.pid) {
-                        unsafe { libc::kill(process.pid as i32, libc::SIGKILL) };
+                        // SAFETY: escalating to SIGKILL after SIGTERM grace period.
+                        unsafe { libc::killpg(pgid, libc::SIGKILL) };
                     }
                 }
 
@@ -439,7 +456,9 @@ impl DaemonCore {
         let proc = self
             .processes
             .get(name)
-            .ok_or_else(|| Error::Process(format!("Script {} not found", name)))?;
+            .ok_or_else(|| Error::ScriptNotFound {
+                name: name.to_string(),
+            })?;
 
         let script_state = ScriptState {
             name: name.to_string(),

@@ -11,8 +11,9 @@ pub fn spawn_cron_task(
     cron_expr: &str,
     event_tx: mpsc::Sender<DaemonEvent>,
 ) -> Result<JoinHandle<()>> {
-    let schedule = Schedule::from_str(cron_expr).map_err(|e| {
-        Error::Process(format!("Invalid cron expression '{}': {}", cron_expr, e))
+    let schedule = Schedule::from_str(cron_expr).map_err(|source| Error::CronParse {
+        expression: cron_expr.to_string(),
+        source,
     })?;
 
     let handle = tokio::spawn(async move {

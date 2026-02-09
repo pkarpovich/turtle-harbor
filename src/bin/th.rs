@@ -78,7 +78,7 @@ where
         let script = config
             .scripts
             .get(&name)
-            .ok_or_else(|| anyhow::anyhow!("Script {} not found", name))?;
+            .ok_or_else(|| Error::ScriptNotFound { name: name.clone() })?;
         execute_for_script(&name, script, command_creator).await?;
     } else {
         tracing::info!("Executing command for all scripts");
