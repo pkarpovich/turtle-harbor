@@ -14,3 +14,45 @@ pub async fn send_command(command: Command) -> Result<Response> {
         Err(_) => Err(Error::CommandTimeout),
     }
 }
+
+pub async fn send_command_follow<F>(command: Command, on_chunk: F) -> Result<()>
+where
+    F: Fn(&str),
+{
+    let socket_path = ipc::get_socket_path();
+    let mut stream = UnixStream::connect(socket_path).await?;
+    ipc::send_command(&mut stream, &command).await?;
+
+    let initial: Response =
+        match timeout(Duration::from_secs(30), ipc::receive_response(&mut stream)).await {
+            Ok(response) => response?,
+            Err(_) => return Err(Error::CommandTimeout),
+        };
+
+    match &initial {
+        Response::Logs(content) => on_chunk(content),
+        Response::Error(e) => return Err(Error::Io(std::io::Error::other(e.clone()))),
+        _ => {}
+    }
+
+    loop {
+        tokio::select! {
+            result = ipc::receive_message::<Response>(&mut stream) => {
+                match result {
+                    Ok(Response::Logs(chunk)) => on_chunk(&chunk),
+                    Ok(Response::Error(e)) => {
+                        tracing::error!("Follow error: {}", e);
+                        break;
+                    }
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}

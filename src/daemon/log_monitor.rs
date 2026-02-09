@@ -1,6 +1,6 @@
 use chrono::Local;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -212,6 +212,45 @@ where
     });
 }
 
+pub fn read_last_n_lines(path: &Path, n: u32) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let file_size = file.metadata()?.len();
+    if file_size == 0 {
+        return Ok(String::new());
+    }
+
+    let n = n as usize;
+    let mut chunk_size: u64 = 8192;
+    let mut collected = Vec::new();
+    let mut remaining = file_size;
+
+    loop {
+        let read_size = chunk_size.min(remaining);
+        remaining -= read_size;
+        file.seek(SeekFrom::Start(remaining))?;
+
+        let mut buf = vec![0u8; read_size as usize];
+        file.read_exact(&mut buf)?;
+
+        collected.splice(0..0, buf);
+
+        let newline_count = collected.iter().filter(|&&b| b == b'\n').count();
+        let has_trailing_newline = collected.last() == Some(&b'\n');
+        let line_count = if has_trailing_newline { newline_count } else { newline_count + 1 };
+
+        if line_count > n || remaining == 0 {
+            break;
+        }
+
+        chunk_size *= 2;
+    }
+
+    let text = String::from_utf8_lossy(&collected);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    Ok(lines[start..].join("\n"))
+}
+
 pub fn ensure_log_dir(log_dir: &Path) -> Result<()> {
     if !log_dir.exists() {
         tracing::debug!(path = ?log_dir, "Creating log directory");
@@ -222,4 +261,20 @@ pub fn ensure_log_dir(log_dir: &Path) -> Result<()> {
 
 pub fn get_log_path(log_dir: &Path, name: &str) -> PathBuf {
     log_dir.join(format!("{}.log", name))
+}
+
+pub fn list_script_names(log_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.strip_suffix(".log").map(|s| s.to_string())
+        })
+        .filter(|name| !name.contains('.'))
+        .collect();
+    names.sort();
+    names
 }

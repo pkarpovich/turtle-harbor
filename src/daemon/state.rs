@@ -1,4 +1,3 @@
-use crate::common::config::RestartPolicy;
 use crate::common::error::Result;
 use crate::common::ipc::ProcessStatus;
 use chrono::{DateTime, Local};
@@ -9,15 +8,13 @@ use tokio::fs;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ScriptState {
     pub name: String,
-    pub command: String,
-    pub restart_policy: RestartPolicy,
-    pub max_restarts: u32,
     pub status: ProcessStatus,
     pub last_started: Option<DateTime<Local>>,
     pub last_stopped: Option<DateTime<Local>>,
     pub exit_code: Option<i32>,
     pub explicitly_stopped: bool,
-    pub cron: Option<String>,
+    #[serde(default)]
+    pub restart_count: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -25,14 +22,17 @@ pub struct RunningState {
     pub version: u32,
     pub scripts: Vec<ScriptState>,
     pub state_file: PathBuf,
+    #[serde(default)]
+    pub config_path: Option<PathBuf>,
 }
 
 impl RunningState {
     pub fn new(state_file: PathBuf) -> Self {
         Self {
-            version: 1,
+            version: 2,
             scripts: Vec::new(),
             state_file,
+            config_path: None,
         }
     }
 
@@ -44,6 +44,7 @@ impl RunningState {
                 version: serializable.version,
                 scripts: serializable.scripts.into_iter().map(Into::into).collect(),
                 state_file: state_file.clone(),
+                config_path: serializable.config_path,
             })
         } else {
             Ok(RunningState::new(state_file.clone()))

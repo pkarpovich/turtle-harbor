@@ -14,7 +14,7 @@ pub struct Settings {
     pub log_dir: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Script {
     pub command: String,
     pub restart_policy: RestartPolicy,
@@ -22,7 +22,7 @@ pub struct Script {
     pub cron: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum RestartPolicy {
     Always,

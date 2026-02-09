@@ -30,6 +30,9 @@ pub enum Error {
         source: cron::error::Error,
     },
 
+    #[error("no configuration loaded - run 'th up' first")]
+    ConfigNotLoaded,
+
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 }
