@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }));
 
-    let server = Server::new()?;
+    let mut server = Server::new()?;
     if let Err(e) = server.run().await {
         tracing::error!("Server error: {}", e);
         return Err(e.into());

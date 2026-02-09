@@ -1,16 +1,18 @@
 use crate::common::error::Result;
 use crate::common::ipc::{self, Command, Profile, Response};
 use crate::daemon::process_manager::ProcessManager;
-use crate::daemon::process_monitor;
+use crate::daemon::process_monitor::{self, ProcessExitEvent};
 use crate::daemon::scheduler::{init_scheduler_tx, CronScheduler};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc;
 
 pub struct Server {
     socket_path: PathBuf,
     process_manager: Arc<ProcessManager>,
+    exit_rx: Option<mpsc::Receiver<ProcessExitEvent>>,
 }
 
 impl Server {
@@ -31,12 +33,13 @@ impl Server {
         };
 
         tracing::info!(state_file = ?state_file, ?log_dir, "Using state file");
-        let process_manager = ProcessManager::new(state_file, log_dir)?;
+        let (process_manager, exit_rx) = ProcessManager::new(state_file, log_dir)?;
         tracing::info!("Process manager initialized successfully");
 
         Ok(Self {
             socket_path: PathBuf::from(ipc::get_socket_path()),
             process_manager: Arc::new(process_manager),
+            exit_rx: Some(exit_rx),
         })
     }
 
@@ -119,21 +122,16 @@ impl Server {
         ))
     }
 
-    async fn start_process_monitor(&self) {
-        let processes = self.process_manager.get_processes();
+    fn start_process_monitor(&mut self) {
+        let exit_rx = self
+            .exit_rx
+            .take()
+            .expect("exit_rx already consumed");
         let pm = Arc::clone(&self.process_manager);
 
-        let restart_handler = Arc::new(move |name, command, policy, max_restarts, cron| {
-            let pm = Arc::clone(&pm);
-            async move {
-                pm.start_script(name, command, policy, max_restarts, cron)
-                    .await
-            }
-        });
-
-        tracing::info!("Starting process monitor using process_monitor module");
+        tracing::info!("Starting event-driven process monitor");
         tokio::spawn(async move {
-            process_monitor::monitor_and_restart(processes, restart_handler).await;
+            process_monitor::monitor_exits(exit_rx, pm).await;
         });
     }
 
@@ -150,11 +148,8 @@ impl Server {
         });
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         tracing::info!("Starting server initialization");
-
-        self.process_manager.restore_state().await?;
-        tracing::info!("State restored successfully");
 
         let listener = self.setup_listener().await?;
         tracing::info!("Socket listener ready");
@@ -162,10 +157,13 @@ impl Server {
         let (mut sigterm, mut sigint) = Self::setup_signal_handlers().await?;
 
         tracing::info!("Starting process monitor");
-        self.start_process_monitor().await;
+        self.start_process_monitor();
 
         tracing::info!("Starting cron scheduler");
         self.start_scheduler().await;
+
+        self.process_manager.restore_state().await?;
+        tracing::info!("State restored successfully");
 
         let process_manager = Arc::clone(&self.process_manager);
         tracing::info!("Starting main server loop");

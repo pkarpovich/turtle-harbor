@@ -2,21 +2,23 @@ use crate::common::config::RestartPolicy;
 use crate::common::error::{Error, Result};
 use crate::common::ipc::{ProcessInfo, ProcessStatus};
 use crate::daemon::log_monitor::{self, ScriptLogger};
+use crate::daemon::process_monitor::ProcessExitEvent;
 use crate::daemon::scheduler::{get_scheduler_tx, SchedulerMessage};
 use crate::daemon::state::{RunningState, ScriptState};
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::BufReader;
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::process::Command;
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 pub struct ManagedProcess {
-    pub child: Child,
+    pub pid: u32,
     pub command: String,
     pub status: ProcessStatus,
     pub start_time: Option<DateTime<Local>>,
@@ -26,6 +28,7 @@ pub struct ManagedProcess {
     pub max_restarts: u32,
     pub cron: Option<String>,
     logger: Option<ScriptLogger>,
+    watcher: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -33,6 +36,7 @@ pub struct ProcessManager {
     pub processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
     pub state: Arc<Mutex<RunningState>>,
     pub log_dir: PathBuf,
+    exit_tx: mpsc::Sender<ProcessExitEvent>,
 }
 
 #[derive(Debug)]
@@ -43,7 +47,10 @@ pub enum ScriptStartResult {
 }
 
 impl ProcessManager {
-    pub fn new(state_file: PathBuf, log_dir: PathBuf) -> Result<Self> {
+    pub fn new(
+        state_file: PathBuf,
+        log_dir: PathBuf,
+    ) -> Result<(Self, mpsc::Receiver<ProcessExitEvent>)> {
         tracing::info!(state_file = ?state_file, ?log_dir, "Creating new ProcessManager");
         let state = RunningState::load(&state_file)?;
 
@@ -52,11 +59,17 @@ impl ProcessManager {
             "State loaded successfully"
         );
 
-        Ok(Self {
-            processes: Arc::new(Mutex::new(HashMap::new())),
-            state: Arc::new(Mutex::new(state)),
-            log_dir,
-        })
+        let (exit_tx, exit_rx) = mpsc::channel(256);
+
+        Ok((
+            Self {
+                processes: Arc::new(Mutex::new(HashMap::new())),
+                state: Arc::new(Mutex::new(state)),
+                log_dir,
+                exit_tx,
+            },
+            exit_rx,
+        ))
     }
 
     pub async fn restore_state(&self) -> Result<()> {
@@ -128,10 +141,6 @@ impl ProcessManager {
         state.scripts.clone()
     }
 
-    pub fn get_processes(&self) -> Arc<Mutex<HashMap<String, ManagedProcess>>> {
-        Arc::clone(&self.processes)
-    }
-
     async fn notify_scheduler(&self, msg: SchedulerMessage) {
         match get_scheduler_tx() {
             Some(tx) => {
@@ -143,68 +152,6 @@ impl ProcessManager {
             None => {
                 tracing::error!("Scheduler tx is None, notification skipped");
             }
-        }
-    }
-
-    fn setup_process_output(command: &str, log_path: &PathBuf, log_dir: &Path) -> Result<(Child, ScriptLogger)> {
-        tracing::debug!(command = %command, path = ?log_path, "Setting up process output");
-        log_monitor::ensure_log_dir(log_dir)?;
-
-        let logger = ScriptLogger::new(log_path.clone())?;
-
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            log_monitor::spawn_stdout_reader(reader, logger.tx.clone());
-        }
-        if let Some(stderr) = child.stderr.take() {
-            let reader = BufReader::new(stderr);
-            log_monitor::spawn_stderr_reader(reader, logger.tx.clone());
-        }
-
-        tracing::debug!("Process output setup completed");
-        Ok((child, logger))
-    }
-
-    async fn check_process_status(&self, name: &str) -> Result<Option<ScriptStartResult>> {
-        let mut processes = self.processes.lock().await;
-
-        if let Some(process) = processes.get_mut(name) {
-            match process.child.try_wait() {
-                Ok(Some(status)) => {
-                    processes.remove(name);
-                    tracing::debug!(
-                        script = %name,
-                        exit_status = ?status,
-                        "Previous process has finished, starting new instance"
-                    );
-                    Ok(None)
-                }
-                Ok(None) => {
-                    tracing::info!(script = %name, "Script is still running - skipping execution");
-                    Ok(Some(ScriptStartResult::AlreadyRunning))
-                }
-                Err(e) => {
-                    tracing::error!(
-                        script = %name,
-                        error = ?e,
-                        "Error checking process status"
-                    );
-                    processes.remove(name);
-                    Err(Error::Process(format!(
-                        "Error checking process status: {}",
-                        e
-                    )))
-                }
-            }
-        } else {
-            Ok(None)
         }
     }
 
@@ -224,14 +171,47 @@ impl ProcessManager {
             "Starting script"
         );
 
-        if let Some(result) = self.check_process_status(&name).await? {
+        if let Some(result) = self.check_process_alive(&name).await? {
             return Ok(result);
         }
 
         let log_path = log_monitor::get_log_path(&self.log_dir, &name);
-        let (child, logger) = Self::setup_process_output(&command, &log_path, &self.log_dir)?;
+        log_monitor::ensure_log_dir(&self.log_dir)?;
+
+        let logger = ScriptLogger::new(log_path.clone())?;
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let pid = child.id().unwrap_or(0);
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            log_monitor::spawn_stdout_reader(reader, logger.tx.clone());
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let reader = BufReader::new(stderr);
+            log_monitor::spawn_stderr_reader(reader, logger.tx.clone());
+        }
+
+        let exit_tx = self.exit_tx.clone();
+        let watcher_name = name.clone();
+        let watcher = tokio::spawn(async move {
+            let status = child.wait().await;
+            let _ = exit_tx
+                .send(ProcessExitEvent {
+                    name: watcher_name,
+                    status: status.ok(),
+                })
+                .await;
+        });
+
         let managed_process = ManagedProcess {
-            child,
+            pid,
             command: command.clone(),
             status: ProcessStatus::Running,
             start_time: Some(Local::now()),
@@ -241,6 +221,7 @@ impl ProcessManager {
             max_restarts,
             cron: cron.clone(),
             logger: Some(logger),
+            watcher: Some(watcher),
         };
 
         {
@@ -250,11 +231,29 @@ impl ProcessManager {
 
         self.update_script_state(&name, ProcessStatus::Running, false, cron)
             .await?;
-        tracing::info!(script = %name, "Script started successfully");
+        tracing::info!(script = %name, pid, "Script started successfully");
         self.notify_scheduler(SchedulerMessage::ScriptUpdated(name.clone()))
             .await;
 
         Ok(ScriptStartResult::Started)
+    }
+
+    async fn check_process_alive(&self, name: &str) -> Result<Option<ScriptStartResult>> {
+        let mut processes = self.processes.lock().await;
+
+        if let Some(process) = processes.get(name) {
+            if process.pid > 0 && is_process_alive(process.pid) {
+                tracing::info!(script = %name, "Script is still running - skipping execution");
+                return Ok(Some(ScriptStartResult::AlreadyRunning));
+            }
+            processes.remove(name);
+            tracing::debug!(
+                script = %name,
+                "Previous process has finished, starting new instance"
+            );
+        }
+
+        Ok(None)
     }
 
     pub async fn stop_script(&self, name: &str) -> Result<()> {
@@ -279,24 +278,27 @@ impl ProcessManager {
         };
 
         if let Some(mut process) = process_opt {
-            match process.child.try_wait() {
-                Ok(Some(_)) => {
-                    tracing::debug!(script = %name, "Process already finished");
+            if process.pid > 0 && is_process_alive(process.pid) {
+                unsafe { libc::kill(process.pid as i32, libc::SIGTERM) };
+
+                if let Some(watcher) = process.watcher.take() {
+                    match tokio::time::timeout(Duration::from_secs(5), watcher).await {
+                        Ok(_) => {
+                            tracing::debug!(script = %name, "Process exited after SIGTERM");
+                        }
+                        Err(_) => {
+                            tracing::warn!(script = %name, "SIGTERM timeout, sending SIGKILL");
+                            unsafe { libc::kill(process.pid as i32, libc::SIGKILL) };
+                        }
+                    }
                 }
-                Ok(None) => match timeout(Duration::from_secs(5), process.child.kill()).await {
-                    Ok(kill_result) => {
-                        kill_result?;
-                        tracing::debug!(script = %name, "Process killed");
-                    }
-                    Err(_) => {
-                        tracing::warn!(script = %name, "Kill operation timed out, forcing kill");
-                        process.child.start_kill()?;
-                    }
-                },
-                Err(e) => {
-                    tracing::error!(script = %name, error = ?e, "Error checking process status");
+            } else {
+                tracing::debug!(script = %name, "Process already finished");
+                if let Some(watcher) = process.watcher.take() {
+                    watcher.abort();
                 }
             }
+
             if let Some(logger) = process.logger.take() {
                 logger.shutdown();
             }
@@ -323,7 +325,19 @@ impl ProcessManager {
                 processes.remove(&name)
             } {
                 tracing::debug!(script = %name, "Killing process");
-                process.child.kill().await?;
+
+                if process.pid > 0 && is_process_alive(process.pid) {
+                    unsafe { libc::kill(process.pid as i32, libc::SIGTERM) };
+                    sleep(Duration::from_millis(100)).await;
+
+                    if is_process_alive(process.pid) {
+                        unsafe { libc::kill(process.pid as i32, libc::SIGKILL) };
+                    }
+                }
+
+                if let Some(watcher) = process.watcher.take() {
+                    watcher.abort();
+                }
                 if let Some(logger) = process.logger.take() {
                     logger.shutdown();
                 }
@@ -350,7 +364,7 @@ impl ProcessManager {
                     .unwrap_or_default();
                 ProcessInfo {
                     name: name.clone(),
-                    pid: process.child.id().unwrap_or(0),
+                    pid: process.pid,
                     status: process.status.clone(),
                     uptime,
                     restart_count: process.restart_count,
@@ -407,3 +421,9 @@ impl ProcessManager {
     }
 }
 
+fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}

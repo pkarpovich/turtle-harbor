@@ -1,137 +1,90 @@
 use crate::common::config::RestartPolicy;
-use crate::common::error::Result;
-use crate::daemon::process_manager::{ManagedProcess, ScriptStartResult};
-use std::collections::HashMap;
-use std::future::Future;
+use crate::daemon::process_manager::ProcessManager;
+use std::process::ExitStatus;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, Copy)]
-pub enum ProcessExitStatus {
-    Success,
-    Error(i32),
-    Terminated,
+pub struct ProcessExitEvent {
+    pub name: String,
+    pub status: Option<ExitStatus>,
 }
 
-pub async fn should_restart(
-    processes: &Arc<Mutex<HashMap<String, ManagedProcess>>>,
-    name: &str,
-) -> Option<(String, RestartPolicy, u32, ProcessExitStatus, Option<String>)> {
-    let mut processes_guard = processes.lock().await;
-    if let Some(process) = processes_guard.get_mut(name) {
-        if let Ok(Some(status)) = process.child.try_wait() {
-            let exit_status = if status.success() {
-                ProcessExitStatus::Success
-            } else if let Some(code) = status.code() {
-                ProcessExitStatus::Error(code)
-            } else {
-                ProcessExitStatus::Terminated
-            };
+pub async fn monitor_exits(
+    mut exit_rx: mpsc::Receiver<ProcessExitEvent>,
+    process_manager: Arc<ProcessManager>,
+) {
+    tracing::info!("Process monitor started (event-driven)");
 
-            match (exit_status, &process.restart_policy) {
-                (ProcessExitStatus::Error(_), RestartPolicy::Always)
-                    if process.restart_count < process.max_restarts =>
-                {
-                    process.restart_count += 1;
-                    tracing::info!(
-                        script = %name,
-                        restart_count = process.restart_count,
-                        max_restarts = process.max_restarts,
-                        "Process failed - initiating restart"
-                    );
-                    return Some((
-                        process.command.clone(),
-                        process.restart_policy.clone(),
-                        process.max_restarts,
-                        exit_status.clone(),
-                        process.cron.clone(),
-                    ));
-                }
-                (ProcessExitStatus::Success, _) => {}
-                (ProcessExitStatus::Error(code), _) => {
-                    tracing::warn!(
-                        script = %name,
-                        exit_code = code,
-                        restart_count = process.restart_count,
-                        max_restarts = process.max_restarts,
-                        "Process failed - max restarts reached or restart policy is Never"
-                    );
-                }
-                (ProcessExitStatus::Terminated, _) => {
-                    tracing::info!(script = %name, "Process was terminated - no restart needed");
-                }
+    while let Some(event) = exit_rx.recv().await {
+        let exit_status = match &event.status {
+            Some(s) if s.success() => {
+                tracing::info!(script = %event.name, "Process exited successfully");
+                continue;
             }
-        }
-    }
-    None
-}
-
-pub async fn check_and_restart_if_needed<F, Fut>(
-    processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
-    name: &str,
-    restart_handler: Arc<F>,
-) where
-    F: Fn(String, String, RestartPolicy, u32, Option<String>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<ScriptStartResult>> + Send,
-{
-    if let Some((command, policy, max_restarts, exit_status, cron)) =
-        should_restart(&processes, name).await
-    {
-        match exit_status {
-            ProcessExitStatus::Error(code) => {
-                tracing::warn!(
-                    script = %name,
-                    exit_code = code,
-                    "Attempting to restart failed process"
-                );
-                if let Err(e) = restart_handler(
-                    name.to_string(),
-                    command,
-                    policy,
-                    max_restarts,
-                    cron,
-                )
-                .await
-                {
-                    tracing::error!(
-                        script = %name,
-                        error = ?e,
-                        "Failed to restart script after error"
-                    );
-                }
+            Some(s) => {
+                let code = s.code().unwrap_or(-1);
+                tracing::warn!(script = %event.name, exit_code = code, "Process exited with error");
+                code
             }
-            _ => {
-                tracing::debug!(
-                    script = %name,
-                    status = ?exit_status,
-                    "Process status change - no restart needed"
-                );
+            None => {
+                tracing::info!(script = %event.name, "Process terminated by signal");
+                continue;
             }
-        }
-    }
-}
-
-pub async fn monitor_and_restart<F, Fut>(
-    processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
-    restart_handler: Arc<F>,
-) where
-    F: Fn(String, String, RestartPolicy, u32, Option<String>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<ScriptStartResult>> + Send,
-{
-    tracing::info!("Starting process monitor");
-    loop {
-        let names = {
-            let processes_guard = processes.lock().await;
-            processes_guard.keys().cloned().collect::<Vec<_>>()
         };
 
-        for name in names {
-            check_and_restart_if_needed(processes.clone(), &name, Arc::clone(&restart_handler))
-                .await;
-        }
+        let restart_info = {
+            let mut processes = process_manager.processes.lock().await;
+            if let Some(process) = processes.get_mut(&event.name) {
+                match &process.restart_policy {
+                    RestartPolicy::Always if process.restart_count < process.max_restarts => {
+                        process.restart_count += 1;
+                        tracing::info!(
+                            script = %event.name,
+                            exit_code = exit_status,
+                            restart_count = process.restart_count,
+                            max_restarts = process.max_restarts,
+                            "Initiating restart"
+                        );
+                        Some((
+                            process.command.clone(),
+                            process.restart_policy.clone(),
+                            process.max_restarts,
+                            process.cron.clone(),
+                        ))
+                    }
+                    _ => {
+                        tracing::warn!(
+                            script = %event.name,
+                            exit_code = exit_status,
+                            restart_count = process.restart_count,
+                            max_restarts = process.max_restarts,
+                            "Max restarts reached or policy is Never"
+                        );
+                        processes.remove(&event.name);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
 
-        sleep(Duration::from_secs(1)).await;
+        if let Some((command, policy, max_restarts, cron)) = restart_info {
+            {
+                process_manager.processes.lock().await.remove(&event.name);
+            }
+            if let Err(e) = process_manager
+                .start_script(event.name.clone(), command, policy, max_restarts, cron)
+                .await
+            {
+                tracing::error!(
+                    script = %event.name,
+                    error = ?e,
+                    "Failed to restart script"
+                );
+            }
+        }
     }
+
+    tracing::info!("Process monitor stopped");
 }
