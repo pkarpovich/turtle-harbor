@@ -123,14 +123,23 @@ impl CronScheduler {
                                 let pm = Arc::clone(&self.process_manager);
                                 let script_state = script.clone();
                                 let handle = tokio::spawn(async move {
+                                    let mut consecutive_failures: u32 = 0;
                                     loop {
-                                        if let Err(e) = run_scheduled_script(&pm, &script_state).await {
-                                            tracing::error!(
-                                                script = %script_state.name,
-                                                error = ?e,
-                                                "Error in scheduler task"
-                                            );
-                                            break;
+                                        match run_scheduled_script(&pm, &script_state).await {
+                                            Ok(_) => {
+                                                consecutive_failures = 0;
+                                            }
+                                            Err(e) => {
+                                                consecutive_failures += 1;
+                                                tracing::error!(
+                                                    script = %script_state.name,
+                                                    error = ?e,
+                                                    consecutive_failures,
+                                                    "Scheduler task error, will retry"
+                                                );
+                                                let backoff_secs = 2u64.saturating_pow(consecutive_failures.min(6));
+                                                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                                            }
                                         }
                                     }
                                 });

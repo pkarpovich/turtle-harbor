@@ -117,7 +117,7 @@ impl ProcessManager {
         };
 
         let mut state = self.state.lock().await;
-        state.update_script(script_state)?;
+        state.update_script(script_state).await?;
 
         tracing::debug!(script = %name, "State updated successfully");
         Ok(())

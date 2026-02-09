@@ -4,6 +4,7 @@ use crate::common::ipc::ProcessStatus;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tokio::fs;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ScriptState {
@@ -49,28 +50,30 @@ impl RunningState {
         }
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub async fn save(&self) -> Result<()> {
         if let Some(parent) = self.state_file.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).await?;
         }
+        let tmp = self.state_file.with_extension("tmp");
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(&self.state_file, content)?;
+        fs::write(&tmp, &content).await?;
+        fs::rename(&tmp, &self.state_file).await?;
         Ok(())
     }
 
-    pub fn update_script(&mut self, script: ScriptState) -> Result<()> {
+    pub async fn update_script(&mut self, script: ScriptState) -> Result<()> {
         if let Some(existing) = self.scripts.iter_mut().find(|s| s.name == script.name) {
             *existing = script;
         } else {
             self.scripts.push(script);
         }
-        self.save()?;
+        self.save().await?;
         Ok(())
     }
 
-    pub fn remove_script(&mut self, name: &str) -> Result<()> {
+    pub async fn remove_script(&mut self, name: &str) -> Result<()> {
         self.scripts.retain(|s| s.name != name);
-        self.save()?;
+        self.save().await?;
         Ok(())
     }
 }
