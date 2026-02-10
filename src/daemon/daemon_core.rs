@@ -1,20 +1,16 @@
-use crate::common::config::{Config, RestartPolicy};
+use crate::common::config::RestartPolicy;
 use crate::common::error::{Error, Result};
-use crate::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
-use crate::daemon::log_monitor::{self, ScriptLogger};
-use crate::daemon::process::{is_process_alive, ManagedProcess, ScriptStartResult};
-use crate::daemon::scheduler;
+use crate::common::ipc::{Command, ProcessStatus, Response};
+use crate::daemon::config_manager::ConfigManager;
+use crate::daemon::cron_manager::CronManager;
+use crate::daemon::log_monitor;
+use crate::daemon::process::ScriptStartResult;
+use crate::daemon::process_supervisor::ProcessSupervisor;
 use crate::daemon::state::{RunningState, ScriptState};
 use chrono::Local;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::io::BufReader;
-use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 pub enum DaemonEvent {
     ClientCommand {
@@ -32,14 +28,12 @@ pub enum DaemonEvent {
 }
 
 pub struct DaemonCore {
-    processes: HashMap<String, ManagedProcess>,
+    supervisor: ProcessSupervisor,
+    config: ConfigManager,
+    cron: CronManager,
     state: RunningState,
-    config: Option<Config>,
-    config_path: Option<PathBuf>,
-    log_dir: PathBuf,
     event_tx: mpsc::Sender<DaemonEvent>,
     event_rx: mpsc::Receiver<DaemonEvent>,
-    cron_tasks: HashMap<String, JoinHandle<()>>,
 }
 
 impl DaemonCore {
@@ -50,15 +44,17 @@ impl DaemonCore {
 
         let (event_tx, event_rx) = mpsc::channel(256);
 
+        let supervisor = ProcessSupervisor::new(event_tx.clone(), log_dir);
+        let config = ConfigManager::new();
+        let cron = CronManager::new(event_tx.clone());
+
         Ok(Self {
-            processes: HashMap::new(),
+            supervisor,
+            config,
+            cron,
             state,
-            config: None,
-            config_path: None,
-            log_dir,
             event_tx,
             event_rx,
-            cron_tasks: HashMap::new(),
         })
     }
 
@@ -67,7 +63,7 @@ impl DaemonCore {
     }
 
     pub fn log_dir(&self) -> &Path {
-        &self.log_dir
+        self.supervisor.log_dir()
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -96,25 +92,20 @@ impl DaemonCore {
         self.shutdown().await
     }
 
-    fn load_config(&mut self, config_path: &Path) -> Result<()> {
-        let config = Config::load(config_path)?;
-        self.log_dir = config.settings.log_dir.clone();
-        self.config = Some(config);
-        self.config_path = Some(config_path.to_path_buf());
-        self.state.config_path = Some(config_path.to_path_buf());
-        Ok(())
-    }
-
-    fn require_config(&self) -> Result<&Config> {
-        self.config.as_ref().ok_or(Error::ConfigNotLoaded)
+    fn sync_log_dir(&mut self) {
+        if let Some(log_dir) = self.config.log_dir() {
+            self.supervisor.set_log_dir(log_dir.to_path_buf());
+        }
     }
 
     async fn handle_command(&mut self, command: Command) -> Response {
         match command {
             Command::Up { name, config_path } => {
-                if let Err(e) = self.load_config(&config_path) {
+                if let Err(e) = self.config.load(&config_path) {
                     return Response::Error(e.to_string());
                 }
+                self.sync_log_dir();
+                self.state.config_path = Some(config_path);
                 match self.start_scripts(name).await {
                     Ok(_) => Response::Success,
                     Err(e) => Response::Error(e.to_string()),
@@ -124,11 +115,12 @@ impl DaemonCore {
                 Ok(_) => Response::Success,
                 Err(e) => Response::Error(e.to_string()),
             },
-            Command::Ps => match self.get_status() {
-                Ok(status) => Response::ProcessList(status),
-                Err(e) => Response::Error(e.to_string()),
-            },
-            Command::Logs { name, tail, follow: _ } => match self.read_logs(name.as_deref(), tail).await {
+            Command::Ps => Response::ProcessList(self.supervisor.status_list()),
+            Command::Logs {
+                name,
+                tail,
+                follow: _,
+            } => match self.read_logs(name.as_deref(), tail).await {
                 Ok(logs) => Response::Logs(logs),
                 Err(e) => Response::Error(e.to_string()),
             },
@@ -140,7 +132,7 @@ impl DaemonCore {
     }
 
     async fn handle_process_exit(&mut self, name: &str, status: Option<ExitStatus>) {
-        let script_def = self.config.as_ref().and_then(|c| c.scripts.get(name));
+        let script_def = self.config.script(name);
         let should_restart = match &status {
             Some(s) if s.success() => {
                 tracing::info!(script = %name, "Process exited successfully");
@@ -149,7 +141,7 @@ impl DaemonCore {
             Some(s) => {
                 let code = s.code().unwrap_or(-1);
                 tracing::warn!(script = %name, exit_code = code, "Process exited with error");
-                match (script_def, self.processes.get(name)) {
+                match (script_def, self.supervisor.get(name)) {
                     (Some(def), Some(proc)) => {
                         matches!(def.restart_policy, RestartPolicy::Always)
                             && proc.restart_count < def.max_restarts
@@ -163,43 +155,50 @@ impl DaemonCore {
             }
         };
 
-        if should_restart {
-            let restart_count = self.processes.get_mut(name).map(|p| {
-                p.restart_count += 1;
-                tracing::info!(
-                    script = %name,
-                    restart_count = p.restart_count,
-                    "Initiating restart"
-                );
-                p.restart_count
-            });
+        if !should_restart {
+            self.supervisor.cleanup_process(name);
+            return;
+        }
 
-            self.cleanup_process(name);
+        let restart_count = self.supervisor.get_mut(name).map(|p| {
+            p.restart_count += 1;
+            tracing::info!(
+                script = %name,
+                restart_count = p.restart_count,
+                "Initiating restart"
+            );
+            p.restart_count
+        });
 
-            if let Some(count) = restart_count {
-                if let Err(e) = self.start_script(name).await {
+        self.supervisor.cleanup_process(name);
+
+        if let Some(count) = restart_count {
+            if let Some(script_def) = self.config.script(name).cloned() {
+                if let Err(e) = self.supervisor.start_script(name, &script_def) {
                     tracing::error!(script = %name, error = ?e, "Failed to restart");
-                } else if let Some(proc) = self.processes.get_mut(name) {
+                } else if let Some(proc) = self.supervisor.get_mut(name) {
                     proc.restart_count = count;
                 }
             }
-        } else {
-            self.cleanup_process(name);
         }
     }
 
     async fn handle_cron_tick(&mut self, name: &str) {
-        let has_script = self
-            .config
-            .as_ref()
-            .map_or(false, |c| c.scripts.contains_key(name));
-        if !has_script {
+        if !self.config.has_script(name) {
             return;
         }
 
-        match self.start_script(name).await {
+        let script_def = match self.config.script(name).cloned() {
+            Some(def) => def,
+            None => return,
+        };
+
+        match self.supervisor.start_script(name, &script_def) {
             Ok(ScriptStartResult::Started) => {
                 tracing::info!(script = %name, "Cron-triggered script started");
+                let _ = self
+                    .update_script_state(name, ProcessStatus::Running, false)
+                    .await;
             }
             Ok(ScriptStartResult::AlreadyRunning) => {
                 tracing::debug!(script = %name, "Cron tick - script already running");
@@ -211,137 +210,59 @@ impl DaemonCore {
     }
 
     async fn start_scripts(&mut self, name: Option<String>) -> Result<()> {
-        match name {
-            Some(name) => {
-                self.start_script(&name).await?;
-            }
-            None => {
-                let names: Vec<String> = self
-                    .require_config()?
-                    .scripts
-                    .keys()
-                    .cloned()
-                    .collect();
-                for name in names {
-                    self.start_script(&name).await?;
-                }
-            }
+        let names: Vec<String> = match name {
+            Some(name) => vec![name],
+            None => self.config.config()?.scripts.keys().cloned().collect(),
+        };
+        for name in names {
+            self.start_script(&name).await?;
         }
         Ok(())
     }
 
     async fn stop_scripts(&mut self, name: Option<String>) -> Result<()> {
-        match name {
-            Some(name) => {
-                self.stop_script(&name).await?;
-            }
-            None => {
-                let names: Vec<String> = self.processes.keys().cloned().collect();
-                for name in names {
-                    self.stop_script(&name).await?;
-                }
-            }
+        let names: Vec<String> = match name {
+            Some(name) => vec![name],
+            None => self.supervisor.names(),
+        };
+        for name in names {
+            self.stop_script(&name).await?;
         }
         Ok(())
     }
 
     async fn start_script(&mut self, name: &str) -> Result<ScriptStartResult> {
         let script_def = self
-            .require_config()?
+            .config
+            .config()?
             .scripts
             .get(name)
             .ok_or_else(|| Error::ScriptNotFound {
                 name: name.to_string(),
             })?
             .clone();
-        let command = script_def.command;
-        let cron = script_def.cron;
 
-        tracing::info!(
-            script = %name,
-            command = %command,
-            "Starting script"
-        );
+        let cron = script_def.cron.clone();
+        let result = self.supervisor.start_script(name, &script_def)?;
 
-        if let Some(process) = self.processes.get(name) {
-            if process.pid > 0 && is_process_alive(process.pid) {
-                tracing::info!(script = %name, "Script is still running - skipping");
-                return Ok(ScriptStartResult::AlreadyRunning);
-            }
-        }
-        self.cleanup_process(name);
+        if matches!(result, ScriptStartResult::Started) {
+            self.update_script_state(name, ProcessStatus::Running, false)
+                .await?;
 
-        let canonical_command = std::fs::canonicalize(&command)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or(command);
-
-        let log_path = log_monitor::get_log_path(&self.log_dir, name);
-        log_monitor::ensure_log_dir(&self.log_dir)?;
-        let logger = ScriptLogger::new(log_path)?;
-
-        let mut child = unsafe {
-            TokioCommand::new("sh")
-                .arg("-c")
-                .arg(&canonical_command)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .pre_exec(|| {
-                    libc::setpgid(0, 0);
-                    Ok(())
-                })
-                .spawn()?
-        };
-
-        let pid = child.id().unwrap_or(0);
-
-        if let Some(stdout) = child.stdout.take() {
-            log_monitor::spawn_stdout_reader(BufReader::new(stdout), logger.tx.clone());
-        }
-        if let Some(stderr) = child.stderr.take() {
-            log_monitor::spawn_stderr_reader(BufReader::new(stderr), logger.tx.clone());
-        }
-
-        let event_tx = self.event_tx.clone();
-        let watcher_name = name.to_string();
-        let watcher = tokio::spawn(async move {
-            let status = child.wait().await;
-            let _ = event_tx
-                .send(DaemonEvent::ProcessExited {
-                    name: watcher_name,
-                    status: status.ok(),
-                })
-                .await;
-        });
-
-        self.processes.insert(
-            name.to_string(),
-            ManagedProcess {
-                pid,
-                status: ProcessStatus::Running,
-                start_time: Some(Local::now()),
-                restart_count: 0,
-                logger: Some(logger),
-                watcher: Some(watcher),
-            },
-        );
-
-        self.update_script_state(name, ProcessStatus::Running, false)
-            .await?;
-
-        if let Some(ref cron_expr) = cron {
-            if !self.cron_tasks.contains_key(name) {
-                self.schedule_cron(name, cron_expr);
+            if let Some(ref cron_expr) = cron {
+                if !self.cron.is_scheduled(name) {
+                    self.cron.schedule(name, cron_expr);
+                }
             }
         }
 
-        tracing::info!(script = %name, pid, "Script started successfully");
-        Ok(ScriptStartResult::Started)
+        Ok(result)
     }
 
     async fn stop_script(&mut self, name: &str) -> Result<()> {
         tracing::info!(script = %name, "Stopping script");
 
-        if !self.processes.contains_key(name)
+        if !self.supervisor.contains(name)
             && !self.state.scripts.iter().any(|s| s.name == name)
         {
             return Err(Error::ScriptNotFound {
@@ -349,108 +270,30 @@ impl DaemonCore {
             });
         }
 
-        if self.processes.contains_key(name) {
+        if self.supervisor.contains(name) {
             self.update_script_state(name, ProcessStatus::Stopped, true)
                 .await?;
         }
 
-        if let Some(mut process) = self.processes.remove(name) {
-            if process.pid > 0 && is_process_alive(process.pid) {
-                let pgid = process.pid as i32;
-                unsafe { libc::killpg(pgid, libc::SIGTERM) };
-
-                if let Some(watcher) = process.watcher.take() {
-                    match tokio::time::timeout(Duration::from_secs(5), watcher).await {
-                        Ok(_) => tracing::debug!(script = %name, "Process group exited after SIGTERM"),
-                        Err(_) => {
-                            tracing::warn!(script = %name, "SIGTERM timeout, sending SIGKILL to process group");
-                            unsafe { libc::killpg(pgid, libc::SIGKILL) };
-                        }
-                    }
-                }
-            } else {
-                if let Some(watcher) = process.watcher.take() {
-                    watcher.abort();
-                }
-            }
-
-            if let Some(logger) = process.logger.take() {
-                logger.shutdown();
-            }
-        }
-
-        self.cancel_cron(name);
+        self.supervisor.stop_script(name).await?;
+        self.cron.cancel(name);
         tracing::info!(script = %name, "Script stopped successfully");
         Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<()> {
-        tracing::info!("Shutting down all processes");
-
-        let names: Vec<String> = self.processes.keys().cloned().collect();
-        for name in names {
-            if let Some(mut process) = self.processes.remove(&name) {
-                tracing::debug!(script = %name, "Killing process");
-
-                if process.pid > 0 && is_process_alive(process.pid) {
-                    let pgid = process.pid as i32;
-                    unsafe { libc::killpg(pgid, libc::SIGTERM) };
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-
-                    if is_process_alive(process.pid) {
-                        unsafe { libc::killpg(pgid, libc::SIGKILL) };
-                    }
-                }
-
-                if let Some(watcher) = process.watcher.take() {
-                    watcher.abort();
-                }
-                if let Some(logger) = process.logger.take() {
-                    logger.shutdown();
-                }
-            }
-        }
-
-        for (_, handle) in self.cron_tasks.drain() {
-            handle.abort();
-        }
-
-        tracing::info!("All processes shut down");
+        self.supervisor.shutdown_all().await;
+        self.cron.cancel_all();
         Ok(())
     }
 
-    fn get_status(&self) -> Result<Vec<ProcessInfo>> {
-        let infos = self
-            .processes
-            .iter()
-            .map(|(name, process)| {
-                let uptime = process
-                    .start_time
-                    .map(|st| {
-                        Local::now()
-                            .signed_duration_since(st)
-                            .to_std()
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
-                ProcessInfo {
-                    name: name.clone(),
-                    pid: process.pid,
-                    status: process.status.clone(),
-                    uptime,
-                    restart_count: process.restart_count,
-                }
-            })
-            .collect();
-        Ok(infos)
-    }
-
     async fn read_logs(&self, name: Option<&str>, tail: u32) -> Result<String> {
-        log_monitor::ensure_log_dir(&self.log_dir)?;
+        let log_dir = self.supervisor.log_dir();
+        log_monitor::ensure_log_dir(log_dir)?;
 
         let names: Vec<String> = match name {
             Some(n) => vec![n.to_string()],
-            None => log_monitor::list_script_names(&self.log_dir),
+            None => log_monitor::list_script_names(log_dir),
         };
 
         if names.is_empty() {
@@ -459,7 +302,7 @@ impl DaemonCore {
 
         let mut output = String::new();
         for (i, script_name) in names.iter().enumerate() {
-            let log_path = log_monitor::get_log_path(&self.log_dir, script_name);
+            let log_path = log_monitor::get_log_path(log_dir, script_name);
             if !log_path.exists() {
                 continue;
             }
@@ -485,10 +328,11 @@ impl DaemonCore {
         if let Some(config_path) = self.state.config_path.clone() {
             if config_path.exists() {
                 tracing::info!(config = ?config_path, "Loading config from state");
-                if let Err(e) = self.load_config(&config_path) {
+                if let Err(e) = self.config.load(&config_path) {
                     tracing::warn!(error = ?e, "Failed to load config from state, skipping restore");
                     return Ok(());
                 }
+                self.sync_log_dir();
             } else {
                 tracing::warn!(config = ?config_path, "Stored config path no longer exists, skipping restore");
                 return Ok(());
@@ -503,11 +347,7 @@ impl DaemonCore {
             if !matches!(script.status, ProcessStatus::Running) || script.explicitly_stopped {
                 continue;
             }
-            let in_config = self
-                .config
-                .as_ref()
-                .map_or(false, |c| c.scripts.contains_key(&script.name));
-            if !in_config {
+            if !self.config.has_script(&script.name) {
                 tracing::info!(script = %script.name, "Skipping restoration - no longer in config");
                 continue;
             }
@@ -517,19 +357,17 @@ impl DaemonCore {
 
         let cron_entries: Vec<(String, String)> = self
             .config
-            .as_ref()
-            .map(|c| {
-                c.scripts
-                    .iter()
-                    .filter(|(name, def)| def.cron.is_some() && !self.cron_tasks.contains_key(*name))
-                    .filter_map(|(name, def)| {
-                        def.cron.as_ref().map(|expr| (name.clone(), expr.clone()))
-                    })
-                    .collect()
+            .script_names()
+            .into_iter()
+            .filter(|name| !self.cron.is_scheduled(name))
+            .filter_map(|name| {
+                self.config
+                    .script(&name)
+                    .and_then(|def| def.cron.as_ref().map(|expr| (name, expr.clone())))
             })
-            .unwrap_or_default();
+            .collect();
         for (name, cron_expr) in cron_entries {
-            self.schedule_cron(&name, &cron_expr);
+            self.cron.schedule(&name, &cron_expr);
         }
 
         tracing::info!("State restoration completed");
@@ -542,8 +380,12 @@ impl DaemonCore {
         status: ProcessStatus,
         explicitly_stopped: bool,
     ) -> Result<()> {
-        let restart_count = self.processes.get(name).map(|p| p.restart_count).unwrap_or(0);
-        let start_time = self.processes.get(name).and_then(|p| p.start_time);
+        let restart_count = self
+            .supervisor
+            .get(name)
+            .map(|p| p.restart_count)
+            .unwrap_or(0);
+        let start_time = self.supervisor.get(name).and_then(|p| p.start_time);
 
         let script_state = ScriptState {
             name: name.to_string(),
@@ -565,89 +407,28 @@ impl DaemonCore {
     }
 
     async fn reload_config(&mut self) -> Result<()> {
-        let config_path = self
-            .config_path
-            .clone()
-            .ok_or(Error::ConfigNotLoaded)?;
+        let diff = self.config.reload()?;
+        self.sync_log_dir();
 
-        tracing::info!(config = ?config_path, "Reloading configuration");
-        let new_config = Config::load(&config_path)?;
-        let old_config = self.config.replace(new_config);
-        self.log_dir = self.config.as_ref().unwrap().settings.log_dir.clone();
-
-        let Some(old_config) = old_config else {
-            return Ok(());
-        };
-
-        let old_names: HashSet<String> = old_config.scripts.keys().cloned().collect();
-        let new_names: HashSet<String> = self
-            .config
-            .as_ref()
-            .unwrap()
-            .scripts
-            .keys()
-            .cloned()
-            .collect();
-
-        let removed: Vec<String> = old_names.difference(&new_names).cloned().collect();
-        for name in removed {
+        for name in diff.removed {
             tracing::info!(script = %name, "Script removed from config, stopping");
             let _ = self.stop_script(&name).await;
             self.state.remove_script(&name).await?;
         }
 
-        let added: Vec<String> = new_names.difference(&old_names).cloned().collect();
-        for name in added {
+        for name in diff.added {
             tracing::info!(script = %name, "New script in config, starting");
             let _ = self.start_script(&name).await;
         }
 
-        let new_scripts = &self.config.as_ref().unwrap().scripts;
-        let changed: Vec<String> = old_names
-            .intersection(&new_names)
-            .filter(|name| old_config.scripts[*name] != new_scripts[*name])
-            .cloned()
-            .collect();
-        for name in changed {
+        for name in diff.changed {
             tracing::info!(script = %name, "Script config changed, restarting");
             let _ = self.stop_script(&name).await;
-            self.cancel_cron(&name);
+            self.cron.cancel(&name);
             let _ = self.start_script(&name).await;
         }
 
         tracing::info!("Configuration reloaded");
         Ok(())
-    }
-
-    fn schedule_cron(&mut self, name: &str, cron_expr: &str) {
-        self.cancel_cron(name);
-
-        match scheduler::spawn_cron_task(name.to_string(), cron_expr, self.event_tx.clone()) {
-            Ok(handle) => {
-                self.cron_tasks.insert(name.to_string(), handle);
-                tracing::info!(script = %name, "Cron task scheduled");
-            }
-            Err(e) => {
-                tracing::error!(script = %name, error = ?e, "Failed to schedule cron");
-            }
-        }
-    }
-
-    fn cancel_cron(&mut self, name: &str) {
-        if let Some(handle) = self.cron_tasks.remove(name) {
-            handle.abort();
-            tracing::debug!(script = %name, "Cron task cancelled");
-        }
-    }
-
-    fn cleanup_process(&mut self, name: &str) {
-        if let Some(mut process) = self.processes.remove(name) {
-            if let Some(watcher) = process.watcher.take() {
-                watcher.abort();
-            }
-            if let Some(logger) = process.logger.take() {
-                logger.shutdown();
-            }
-        }
     }
 }
