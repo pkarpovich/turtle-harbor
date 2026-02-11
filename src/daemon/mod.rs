@@ -1,6 +1,8 @@
 mod config_manager;
 mod cron_manager;
 mod daemon_core;
+pub mod health;
+mod http_server;
 mod log_monitor;
 mod process;
 mod process_supervisor;

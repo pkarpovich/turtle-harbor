@@ -1,19 +1,25 @@
 use crate::common::error::Result;
 use crate::common::ipc::{self, Command, Profile, Response};
 use crate::daemon::daemon_core::{DaemonCore, DaemonEvent, LogChannels};
+use crate::daemon::health::HealthSnapshot;
+use crate::daemon::http_server;
 use std::path::PathBuf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub struct Server {
     socket_path: PathBuf,
     daemon_core: DaemonCore,
     log_channels: LogChannels,
+    health: HealthSnapshot,
+    http_port: Option<u16>,
+    http_bind: String,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl Server {
-    pub fn new() -> Result<Self> {
+    pub fn new(http_port: Option<u16>, http_bind: String) -> Result<Self> {
         tracing::info!("Starting server initialization");
         let brew_var =
             std::env::var("HOMEBREW_VAR").unwrap_or_else(|_| "/opt/homebrew/var".to_string());
@@ -31,12 +37,18 @@ impl Server {
 
         let daemon_core = DaemonCore::new(state_file, log_dir)?;
         let log_channels = daemon_core.log_channels();
+        let health = daemon_core.health_snapshot();
+        let (shutdown_tx, _) = watch::channel(false);
         tracing::info!("DaemonCore initialized successfully");
 
         Ok(Self {
             socket_path: PathBuf::from(ipc::get_socket_path()),
             daemon_core,
             log_channels,
+            health,
+            http_port,
+            http_bind,
+            shutdown_tx,
         })
     }
 
@@ -48,7 +60,21 @@ impl Server {
         tokio::spawn(accept_loop(listener, event_tx.clone(), log_channels));
         tokio::spawn(signal_handler(event_tx));
 
+        if let Some(port) = self.http_port {
+            let health = self.health.clone();
+            let bind = self.http_bind.clone();
+            let shutdown_rx = self.shutdown_tx.subscribe();
+            tokio::spawn(http_server::run_http_server(
+                bind,
+                port,
+                health,
+                shutdown_rx,
+            ));
+        }
+
         self.daemon_core.run().await?;
+
+        let _ = self.shutdown_tx.send(true);
 
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path)?;

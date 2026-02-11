@@ -1,7 +1,18 @@
+use clap::Parser;
 use std::path::PathBuf;
 use turtle_harbor::common::ipc::Profile;
 use turtle_harbor::common::logging;
 use turtle_harbor::daemon::server::Server;
+
+#[derive(Parser)]
+#[command(name = "turtled", about = "Turtle Harbor daemon")]
+struct Args {
+    #[arg(long)]
+    http_port: Option<u16>,
+
+    #[arg(long, default_value = "0.0.0.0")]
+    http_bind: String,
+}
 
 fn resolve_log_dir() -> PathBuf {
     let brew_var =
@@ -14,6 +25,8 @@ fn resolve_log_dir() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
     let log_dir = resolve_log_dir();
     if !log_dir.exists() {
         std::fs::create_dir_all(&log_dir)?;
@@ -32,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }));
 
-    let mut server = Server::new()?;
+    let mut server = Server::new(args.http_port, args.http_bind)?;
     if let Err(e) = server.run().await {
         tracing::error!("Server error: {}", e);
         return Err(e.into());
