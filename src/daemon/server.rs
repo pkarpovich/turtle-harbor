@@ -1,16 +1,15 @@
 use crate::common::error::Result;
 use crate::common::ipc::{self, Command, Profile, Response};
-use crate::daemon::process_manager::ProcessManager;
-use crate::daemon::process_monitor;
-use crate::daemon::scheduler::{init_scheduler_tx, CronScheduler};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use crate::daemon::daemon_core::{DaemonCore, DaemonEvent, LogChannels};
+use std::path::PathBuf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{mpsc, oneshot};
 
 pub struct Server {
-    socket_path: String,
-    process_manager: Arc<ProcessManager>,
+    socket_path: PathBuf,
+    daemon_core: DaemonCore,
+    log_channels: LogChannels,
 }
 
 impl Server {
@@ -25,196 +24,155 @@ impl Server {
             }
         };
 
-        tracing::info!(state_file = ?state_file, "Using state file");
-        let process_manager = match ProcessManager::new(state_file) {
-            Ok(pm) => {
-                tracing::info!("Process manager initialized successfully");
-                pm
-            }
-            Err(e) => {
-                tracing::error!(error = ?e, "Failed to initialize process manager");
-                return Err(e);
-            }
+        let log_dir = match Profile::current() {
+            Profile::Development => PathBuf::from("logs"),
+            Profile::Production => PathBuf::from(format!("{}/log/turtle-harbor", brew_var)),
         };
 
+        let daemon_core = DaemonCore::new(state_file, log_dir)?;
+        let log_channels = daemon_core.log_channels();
+        tracing::info!("DaemonCore initialized successfully");
+
         Ok(Self {
-            socket_path: ipc::get_socket_path().to_string(),
-            process_manager: Arc::new(process_manager),
+            socket_path: PathBuf::from(ipc::get_socket_path()),
+            daemon_core,
+            log_channels,
         })
     }
 
-    async fn handle_command(process_manager: &ProcessManager, command: Command) -> Response {
-        match command {
-            Command::Up {
-                name,
-                command,
-                restart_policy,
-                max_restarts,
-                cron,
-            } => match process_manager
-                .start_script(name, command, restart_policy, max_restarts, cron)
-                .await
-            {
-                Ok(_) => Response::Success,
-                Err(e) => Response::Error(e.to_string()),
-            },
-            Command::Down { name } => match process_manager.stop_script(&name).await {
-                Ok(_) => Response::Success,
-                Err(e) => Response::Error(e.to_string()),
-            },
-            Command::Ps => match process_manager.get_status().await {
-                Ok(status) => Response::ProcessList(status),
-                Err(e) => Response::Error(e.to_string()),
-            },
-            Command::Logs { name } => match process_manager.read_logs(&name).await {
-                Ok(logs) => Response::Logs(logs),
-                Err(e) => Response::Error(e.to_string()),
-            },
-        }
-    }
+    pub async fn run(&mut self) -> Result<()> {
+        let listener = self.setup_listener()?;
+        let event_tx = self.daemon_core.event_tx();
+        let log_channels = self.log_channels.clone();
 
-    async fn handle_client(process_manager: Arc<ProcessManager>, mut stream: UnixStream) {
-        while let Ok(command) = ipc::receive_command(&mut stream).await {
-            tracing::info!(command = ?command, "Received command");
-            let response = Self::handle_command(&process_manager, command).await;
-            if let Err(e) = ipc::send_response(&mut stream, &response).await {
-                tracing::error!(error = ?e, "Failed to send response");
-                break;
-            }
-        }
-    }
+        tokio::spawn(accept_loop(listener, event_tx.clone(), log_channels));
+        tokio::spawn(signal_handler(event_tx));
 
-    async fn accept_loop(listener: UnixListener, process_manager: Arc<ProcessManager>) {
-        loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    tracing::debug!(addr = ?addr, "Accepted new connection");
-                    let pm = Arc::clone(&process_manager);
-                    tokio::spawn(async move {
-                        Self::handle_client(pm, stream).await;
-                    });
-                }
-                Err(e) => {
-                    tracing::error!(error = ?e, "Accept error");
-                    break;
-                }
-            }
-        }
-    }
+        self.daemon_core.run().await?;
 
-    async fn setup_listener(&self) -> Result<UnixListener> {
-        if Path::new(&self.socket_path).exists() {
-            tracing::info!(path = ?self.socket_path, "Removing existing socket file");
-            std::fs::remove_file(&self.socket_path)?;
-        }
-        tracing::info!(path = ?self.socket_path, "Creating new socket listener");
-        let listener = UnixListener::bind(&self.socket_path)?;
-        tracing::info!(path = ?self.socket_path, "Server listening");
-        Ok(listener)
-    }
-
-    async fn setup_signal_handlers(
-    ) -> Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
-        tracing::debug!("Setting up signal handlers");
-        Ok((
-            signal(SignalKind::terminate())?,
-            signal(SignalKind::interrupt())?,
-        ))
-    }
-
-    async fn start_process_monitor(&self) {
-        let processes = self.process_manager.get_processes();
-        let pm = Arc::clone(&self.process_manager);
-
-        let restart_handler = Arc::new(move |name, command, policy, max_restarts, _, cron| {
-            let pm = Arc::clone(&pm);
-            async move {
-                pm.start_script(name, command, policy, max_restarts, cron)
-                    .await
-            }
-        });
-
-        tracing::info!("Starting process monitor using process_monitor module");
-        tokio::spawn(async move {
-            process_monitor::monitor_and_restart(processes, restart_handler).await;
-        });
-    }
-
-    async fn start_scheduler(&self) {
-        let process_manager = Arc::clone(&self.process_manager);
-        let (mut scheduler, scheduler_tx) = CronScheduler::new(process_manager);
-
-        init_scheduler_tx(scheduler_tx);
-
-        tokio::spawn(async move {
-            if let Err(e) = scheduler.start().await {
-                tracing::error!(error = ?e, "Cron scheduler error");
-            }
-        });
-    }
-
-    pub async fn run(&self) -> Result<()> {
-        tracing::info!("Starting server initialization");
-
-        match self.process_manager.restore_state().await {
-            Ok(_) => tracing::info!("State restored successfully"),
-            Err(e) => {
-                tracing::error!(error = ?e, "Failed to restore state");
-                return Err(e);
-            }
-        }
-
-        tracing::info!("Setting up socket listener");
-        let listener = match self.setup_listener().await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(error = ?e, "Failed to setup listener");
-                return Err(e);
-            }
-        };
-
-        tracing::info!("Setting up signal handlers");
-        let (mut sigterm, mut sigint) = match Self::setup_signal_handlers().await {
-            Ok(handlers) => handlers,
-            Err(e) => {
-                tracing::error!(error = ?e, "Failed to setup signal handlers");
-                return Err(e);
-            }
-        };
-
-        tracing::info!("Starting process monitor");
-        self.start_process_monitor().await;
-
-        tracing::info!("Starting cron scheduler");
-        self.start_scheduler().await;
-
-        let process_manager = Arc::clone(&self.process_manager);
-        tracing::info!("Starting main server loop");
-        tokio::select! {
-            result = Self::accept_loop(listener, process_manager) => {
-               tracing::info!(result = ?result, "Accept loop terminated");
-            },
-            _ = sigterm.recv() => {
-               tracing::info!("Received SIGTERM, shutting down...");
-            }
-            _ = sigint.recv() => {
-               tracing::info!("Received SIGINT, shutting down...");
-            }
-        }
-
-        tracing::info!("Starting shutdown sequence");
-        self.shutdown().await
-    }
-
-    async fn shutdown(&self) -> Result<()> {
-        tracing::info!("Shutting down processes");
-        self.process_manager.shutdown().await?;
-
-        if Path::new(&self.socket_path).exists() {
-            tracing::info!("Removing socket file");
+        if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path)?;
         }
         tracing::info!("Shutdown complete");
         Ok(())
     }
+
+    fn setup_listener(&self) -> Result<UnixListener> {
+        if self.socket_path.exists() {
+            tracing::info!(path = ?self.socket_path, "Removing existing socket file");
+            std::fs::remove_file(&self.socket_path)?;
+        }
+        let listener = UnixListener::bind(&self.socket_path)?;
+        tracing::info!(path = ?self.socket_path, "Server listening");
+        Ok(listener)
+    }
+}
+
+async fn accept_loop(
+    listener: UnixListener,
+    event_tx: mpsc::Sender<DaemonEvent>,
+    log_channels: LogChannels,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                tracing::debug!(addr = ?addr, "Accepted new connection");
+                let tx = event_tx.clone();
+                let lc = log_channels.clone();
+                tokio::spawn(handle_client(stream, tx, lc));
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "Accept error");
+                break;
+            }
+        }
+    }
+}
+
+async fn handle_client(
+    mut stream: UnixStream,
+    event_tx: mpsc::Sender<DaemonEvent>,
+    log_channels: LogChannels,
+) {
+    while let Ok(command) = ipc::receive_command(&mut stream).await {
+        tracing::info!(command = ?command, "Received command");
+
+        let follow_name = match &command {
+            Command::Logs { name, follow: true, .. } => name.clone(),
+            _ => None,
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        if event_tx
+            .send(DaemonEvent::ClientCommand { command, reply_tx })
+            .await
+            .is_err()
+        {
+            tracing::error!("Failed to send command to daemon core");
+            break;
+        }
+
+        match reply_rx.await {
+            Ok(response) => {
+                if let Err(e) = ipc::send_response(&mut stream, &response).await {
+                    tracing::error!(error = ?e, "Failed to send response");
+                    break;
+                }
+            }
+            Err(_) => {
+                tracing::error!("Daemon core dropped reply channel");
+                break;
+            }
+        }
+
+        if let Some(name) = follow_name {
+            follow_via_broadcast(&mut stream, &log_channels, &name).await;
+            break;
+        }
+    }
+}
+
+async fn follow_via_broadcast(stream: &mut UnixStream, log_channels: &LogChannels, name: &str) {
+    let rx = log_channels
+        .lock()
+        .ok()
+        .and_then(|channels| channels.get(name).map(|tx| tx.subscribe()));
+    let mut rx = match rx {
+        Some(rx) => rx,
+        None => {
+            let response = Response::Error(format!("No active log channel for '{}'", name));
+            let _ = ipc::send_response(stream, &response).await;
+            return;
+        }
+    };
+
+    loop {
+        match rx.recv().await {
+            Ok(line) => {
+                let response = Response::Logs(line);
+                if ipc::send_response(stream, &response).await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(script = %name, skipped = n, "Follow client lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                break;
+            }
+        }
+    }
+}
+
+async fn signal_handler(event_tx: mpsc::Sender<DaemonEvent>) {
+    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down..."),
+        _ = sigint.recv() => tracing::info!("Received SIGINT, shutting down..."),
+    }
+
+    let _ = event_tx.send(DaemonEvent::Shutdown).await;
 }

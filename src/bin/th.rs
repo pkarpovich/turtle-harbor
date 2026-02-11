@@ -2,12 +2,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
-use futures::future;
 use std::time::Duration;
-use tracing_subscriber::EnvFilter;
 use turtle_harbor::client::commands;
 use turtle_harbor::client::error::handle_error;
-use turtle_harbor::common::config::{Config, Script};
+use turtle_harbor::common::error::Error;
 use turtle_harbor::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
 
 #[derive(Parser)]
@@ -16,7 +14,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
     #[arg(short, long, default_value = "scripts.yml")]
-    pub config: String,
+    pub config: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -24,18 +22,14 @@ pub enum Commands {
     Up { script_name: Option<String> },
     Down { script_name: Option<String> },
     Ps,
-    Logs { script_name: Option<String> },
-}
-
-fn init_cli_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("turtle_harbor=info,cli=info"));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_ansi(true)
-        .init();
+    Logs {
+        script_name: Option<String>,
+        #[arg(short = 'n', long, default_value = "100")]
+        tail: u32,
+        #[arg(short, long)]
+        follow: bool,
+    },
+    Reload,
 }
 
 pub fn format_duration(duration: Duration) -> String {
@@ -54,57 +48,6 @@ pub fn format_status(status: ProcessStatus) -> ColoredString {
     }
 }
 
-async fn execute_for_script<F>(name: &str, script: &Script, command_creator: F) -> Result<()>
-where
-    F: Fn(&str, &Script) -> Command + Copy,
-{
-    let cmd = command_creator(name, script);
-    let response = commands::send_command(cmd).await?;
-    handle_response(name, response);
-    Ok(())
-}
-
-async fn process_command_for_scripts<F>(
-    script_name: Option<String>,
-    config: &Config,
-    command_creator: F,
-) -> Result<()>
-where
-    F: Fn(&str, &Script) -> Command + Copy,
-{
-    if let Some(name) = script_name {
-        tracing::info!("Executing command for script {}", name);
-        let script = config
-            .scripts
-            .get(&name)
-            .ok_or_else(|| anyhow::anyhow!("Script {} not found", name))?;
-        execute_for_script(&name, script, command_creator).await?;
-    } else {
-        tracing::info!("Executing command for all scripts");
-        let tasks = config.scripts.iter().map(|(name, script)| {
-            tracing::debug!("Preparing task for script {}", name);
-            execute_for_script(name, script, command_creator)
-        });
-        future::join_all(tasks).await;
-    }
-    Ok(())
-}
-
-fn handle_response(name: &str, response: Response) {
-    match response {
-        Response::Success => tracing::info!("Script {} executed successfully", name),
-        Response::Error(e) => tracing::error!("Error for script {}: {}", name, e),
-        Response::Logs(logs) => {
-            if logs.is_empty() {
-                tracing::info!("No logs available for {}", name);
-            } else {
-                println!("=== Logs for {} ===\n{}", name, logs);
-            }
-        }
-        _ => tracing::error!("Unexpected response for script {}", name),
-    }
-}
-
 fn print_process_list_table(processes: &[ProcessInfo]) {
     println!(
         "{:<20} {:<6} {:<10} {:<10} {:<8}",
@@ -120,7 +63,7 @@ fn print_process_list_table(processes: &[ProcessInfo]) {
             "{:<20} {:<6} {:<10} {:<10} {:<8}",
             process.name,
             process.pid,
-            format_status(process.status.clone()),
+            format_status(process.status),
             format_duration(process.uptime),
             process.restart_count
         );
@@ -129,45 +72,38 @@ fn print_process_list_table(processes: &[ProcessInfo]) {
 
 #[tokio::main]
 pub async fn main() {
-    init_cli_logging();
     let cli = Cli::parse();
 
     if let Err(e) = run(cli).await {
-        tracing::error!(?e, "Command failed");
-        handle_error(e.into());
+        match e.downcast::<Error>() {
+            Ok(err) => handle_error(err),
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let config = Config::load(&cli.config)?;
+    let config_path = std::fs::canonicalize(&cli.config).unwrap_or(cli.config);
 
     match cli.command {
         Commands::Up { script_name } => {
-            process_command_for_scripts(script_name, &config, |name, script| {
-                let path = std::fs::canonicalize(&script.command)
-                    .unwrap_or_else(|_| PathBuf::from(&script.command));
-
-                Command::Up {
-                    restart_policy: script.restart_policy.clone(),
-                    command: path.to_string_lossy().to_string(),
-                    max_restarts: script.max_restarts,
-                    name: name.to_string(),
-                    cron: script.cron.clone(),
-                }
-            })
-                .await?;
+            let response = commands::send_command(Command::Up { name: script_name, config_path }).await?;
+            match response {
+                Response::Success => println!("Scripts started successfully"),
+                Response::Error(e) => eprintln!("Error: {}", e),
+                _ => eprintln!("Unexpected response"),
+            }
         }
         Commands::Down { script_name } => {
-            process_command_for_scripts(script_name, &config, |name, _| Command::Down {
-                name: name.to_string(),
-            })
-            .await?;
-        }
-        Commands::Logs { script_name } => {
-            process_command_for_scripts(script_name, &config, |name, _| Command::Logs {
-                name: name.to_string(),
-            })
-            .await?;
+            let response = commands::send_command(Command::Down { name: script_name }).await?;
+            match response {
+                Response::Success => println!("Scripts stopped successfully"),
+                Response::Error(e) => eprintln!("Error: {}", e),
+                _ => eprintln!("Unexpected response"),
+            }
         }
         Commands::Ps => {
             let response = commands::send_command(Command::Ps).await?;
@@ -175,6 +111,54 @@ async fn run(cli: Cli) -> Result<()> {
                 Response::ProcessList(processes) => print_process_list_table(&processes),
                 Response::Error(e) => eprintln!("Error retrieving process list: {}", e),
                 _ => eprintln!("Unexpected response for ps command"),
+            }
+        }
+        Commands::Logs {
+            script_name,
+            tail,
+            follow,
+        } => {
+            if follow && script_name.is_none() {
+                eprintln!("Error: --follow requires a script name");
+                std::process::exit(1);
+            }
+
+            let cmd = Command::Logs {
+                name: script_name.clone(),
+                tail,
+                follow,
+            };
+
+            if follow {
+                commands::send_command_follow(cmd, |chunk| {
+                    print!("{}", chunk);
+                })
+                .await?;
+            } else {
+                let response = commands::send_command(cmd).await?;
+                let label = script_name.as_deref().unwrap_or("all scripts");
+                match response {
+                    Response::Logs(logs) if logs.is_empty() => {
+                        println!("No logs available for {}", label);
+                    }
+                    Response::Logs(logs) => {
+                        if script_name.is_some() {
+                            println!("=== Logs for {} ===\n{}", label, logs);
+                        } else {
+                            println!("{}", logs);
+                        }
+                    }
+                    Response::Error(e) => eprintln!("Error: {}", e),
+                    _ => eprintln!("Unexpected response"),
+                }
+            }
+        }
+        Commands::Reload => {
+            let response = commands::send_command(Command::Reload).await?;
+            match response {
+                Response::Success => println!("Configuration reloaded"),
+                Response::Error(e) => eprintln!("Reload error: {}", e),
+                _ => eprintln!("Unexpected response"),
             }
         }
     }

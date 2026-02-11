@@ -1,27 +1,20 @@
-use crate::common::config::RestartPolicy;
+use crate::common::error::Result;
+use crate::common::ipc::ProcessStatus;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum ScriptStatus {
-    Running,
-    Stopped,
-    Failed,
-}
+use tokio::fs;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ScriptState {
     pub name: String,
-    pub command: String,
-    pub restart_policy: RestartPolicy,
-    pub max_restarts: u32,
-    pub status: ScriptStatus,
+    pub status: ProcessStatus,
     pub last_started: Option<DateTime<Local>>,
     pub last_stopped: Option<DateTime<Local>>,
     pub exit_code: Option<i32>,
     pub explicitly_stopped: bool,
-    pub cron: Option<String>,
+    #[serde(default)]
+    pub restart_count: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -29,18 +22,21 @@ pub struct RunningState {
     pub version: u32,
     pub scripts: Vec<ScriptState>,
     pub state_file: PathBuf,
+    #[serde(default)]
+    pub config_path: Option<PathBuf>,
 }
 
 impl RunningState {
     pub fn new(state_file: PathBuf) -> Self {
         Self {
-            version: 1,
+            version: 2,
             scripts: Vec::new(),
             state_file,
+            config_path: None,
         }
     }
 
-    pub fn load(state_file: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(state_file: &PathBuf) -> Result<Self> {
         if state_file.exists() {
             let content = std::fs::read_to_string(&state_file)?;
             let serializable: RunningState = serde_json::from_str(&content)?;
@@ -48,34 +44,37 @@ impl RunningState {
                 version: serializable.version,
                 scripts: serializable.scripts.into_iter().map(Into::into).collect(),
                 state_file: state_file.clone(),
+                config_path: serializable.config_path,
             })
         } else {
             Ok(RunningState::new(state_file.clone()))
         }
     }
 
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn save(&self) -> Result<()> {
         if let Some(parent) = self.state_file.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).await?;
         }
+        let tmp = self.state_file.with_extension("tmp");
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(&self.state_file, content)?;
+        fs::write(&tmp, &content).await?;
+        fs::rename(&tmp, &self.state_file).await?;
         Ok(())
     }
 
-    pub fn update_script(&mut self, script: ScriptState) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn update_script(&mut self, script: ScriptState) -> Result<()> {
         if let Some(existing) = self.scripts.iter_mut().find(|s| s.name == script.name) {
             *existing = script;
         } else {
             self.scripts.push(script);
         }
-        self.save()?;
+        self.save().await?;
         Ok(())
     }
 
-    pub fn remove_script(&mut self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn remove_script(&mut self, name: &str) -> Result<()> {
         self.scripts.retain(|s| s.name != name);
-        self.save()?;
+        self.save().await?;
         Ok(())
     }
 }

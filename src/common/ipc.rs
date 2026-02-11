@@ -1,4 +1,3 @@
-use crate::common::config::RestartPolicy;
 use crate::common::error::Result;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::time::Duration;
@@ -36,20 +35,11 @@ pub fn get_socket_path() -> &'static str {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Command {
-    Up {
-        name: String,
-        command: String,
-        restart_policy: RestartPolicy,
-        max_restarts: u32,
-        cron: Option<String>,
-    },
-    Down {
-        name: String,
-    },
+    Up { name: Option<String>, config_path: std::path::PathBuf },
+    Down { name: Option<String> },
     Ps,
-    Logs {
-        name: String,
-    },
+    Logs { name: Option<String>, tail: u32, follow: bool },
+    Reload,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -69,7 +59,7 @@ pub struct ProcessInfo {
     pub restart_count: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub enum ProcessStatus {
     Running,
     Stopped,
@@ -85,11 +75,20 @@ async fn send_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Res
     Ok(())
 }
 
-async fn receive_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
+const MAX_MESSAGE_SIZE: u32 = 10 * 1024 * 1024;
+
+pub async fn receive_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await?;
     let len = u32::from_le_bytes(len_bytes);
     tracing::trace!(message_len = len, "Receiving message");
+
+    if len > MAX_MESSAGE_SIZE {
+        return Err(crate::common::error::Error::MessageTooLarge {
+            size: len,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
 
     let mut buffer = vec![0u8; len as usize];
     stream.read_exact(&mut buffer).await?;
