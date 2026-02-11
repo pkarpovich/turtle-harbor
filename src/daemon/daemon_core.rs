@@ -8,9 +8,13 @@ use crate::daemon::process::ScriptStartResult;
 use crate::daemon::process_supervisor::ProcessSupervisor;
 use crate::daemon::state::{RunningState, ScriptState};
 use chrono::Local;
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::ExitStatus;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+pub type LogChannels = Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>;
 
 pub enum DaemonEvent {
     ClientCommand {
@@ -34,6 +38,7 @@ pub struct DaemonCore {
     state: RunningState,
     event_tx: mpsc::Sender<DaemonEvent>,
     event_rx: mpsc::Receiver<DaemonEvent>,
+    log_channels: LogChannels,
 }
 
 impl DaemonCore {
@@ -47,6 +52,7 @@ impl DaemonCore {
         let supervisor = ProcessSupervisor::new(event_tx.clone(), log_dir);
         let config = ConfigManager::new();
         let cron = CronManager::new(event_tx.clone());
+        let log_channels = Arc::new(Mutex::new(HashMap::new()));
 
         Ok(Self {
             supervisor,
@@ -55,6 +61,7 @@ impl DaemonCore {
             state,
             event_tx,
             event_rx,
+            log_channels,
         })
     }
 
@@ -62,8 +69,8 @@ impl DaemonCore {
         self.event_tx.clone()
     }
 
-    pub fn log_dir(&self) -> &Path {
-        self.supervisor.log_dir()
+    pub fn log_channels(&self) -> LogChannels {
+        self.log_channels.clone()
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -174,7 +181,12 @@ impl DaemonCore {
 
         if let Some(count) = restart_count {
             if let Some(script_def) = self.config.script(name).cloned() {
-                if let Err(e) = self.supervisor.start_script(name, &script_def) {
+                let (broadcast_tx, _) = broadcast::channel(256);
+                self.log_channels
+                    .lock()
+                    .unwrap()
+                    .insert(name.to_string(), broadcast_tx.clone());
+                if let Err(e) = self.supervisor.start_script(name, &script_def, broadcast_tx) {
                     tracing::error!(script = %name, error = ?e, "Failed to restart");
                 } else if let Some(proc) = self.supervisor.get_mut(name) {
                     proc.restart_count = count;
@@ -193,7 +205,12 @@ impl DaemonCore {
             None => return,
         };
 
-        match self.supervisor.start_script(name, &script_def) {
+        let (broadcast_tx, _) = broadcast::channel(256);
+        self.log_channels
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), broadcast_tx.clone());
+        match self.supervisor.start_script(name, &script_def, broadcast_tx) {
             Ok(ScriptStartResult::Started) => {
                 tracing::info!(script = %name, "Cron-triggered script started");
                 let _ = self
@@ -243,7 +260,12 @@ impl DaemonCore {
             .clone();
 
         let cron = script_def.cron.clone();
-        let result = self.supervisor.start_script(name, &script_def)?;
+        let (broadcast_tx, _) = broadcast::channel(256);
+        self.log_channels
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), broadcast_tx.clone());
+        let result = self.supervisor.start_script(name, &script_def, broadcast_tx)?;
 
         if matches!(result, ScriptStartResult::Started) {
             self.update_script_state(name, ProcessStatus::Running, false)
@@ -276,6 +298,7 @@ impl DaemonCore {
         }
 
         self.supervisor.stop_script(name).await?;
+        self.log_channels.lock().unwrap().remove(name);
         self.cron.cancel(name);
         tracing::info!(script = %name, "Script stopped successfully");
         Ok(())
@@ -284,6 +307,7 @@ impl DaemonCore {
     async fn shutdown(&mut self) -> Result<()> {
         self.supervisor.shutdown_all().await;
         self.cron.cancel_all();
+        self.log_channels.lock().unwrap().clear();
         Ok(())
     }
 

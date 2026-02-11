@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::process::Command as TokioCommand;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 pub struct ProcessSupervisor {
     processes: HashMap<String, ManagedProcess>,
@@ -36,7 +36,7 @@ impl ProcessSupervisor {
         &self.log_dir
     }
 
-    pub fn start_script(&mut self, name: &str, script_def: &Script) -> Result<ScriptStartResult> {
+    pub fn start_script(&mut self, name: &str, script_def: &Script, broadcast_tx: broadcast::Sender<String>) -> Result<ScriptStartResult> {
         tracing::info!(
             script = %name,
             command = %script_def.command,
@@ -57,7 +57,7 @@ impl ProcessSupervisor {
 
         let log_path = log_monitor::get_log_path(&self.log_dir, name);
         log_monitor::ensure_log_dir(&self.log_dir)?;
-        let logger = ScriptLogger::new(log_path)?;
+        let logger = ScriptLogger::new(log_path, broadcast_tx)?;
 
         let mut child = unsafe {
             TokioCommand::new("sh")

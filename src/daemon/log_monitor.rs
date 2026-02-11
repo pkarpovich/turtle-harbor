@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 
@@ -26,11 +26,11 @@ pub struct ScriptLogger {
 }
 
 impl ScriptLogger {
-    pub fn new(log_path: PathBuf) -> Result<Self> {
+    pub fn new(log_path: PathBuf, broadcast_tx: broadcast::Sender<String>) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<LogLine>(CHANNEL_BUFFER);
 
         let writer_handle = tokio::spawn(async move {
-            if let Err(e) = writer_loop(rx, &log_path).await {
+            if let Err(e) = writer_loop(rx, &log_path, broadcast_tx).await {
                 tracing::error!(error = ?e, path = ?log_path, "Log writer error");
             }
         });
@@ -121,6 +121,7 @@ fn rotated_path(base: &Path, index: u32) -> PathBuf {
 async fn writer_loop(
     mut rx: mpsc::Receiver<LogLine>,
     log_path: &Path,
+    broadcast_tx: broadcast::Sender<String>,
 ) -> std::io::Result<()> {
     let mut writer = RotatingWriter::new(log_path)?;
     let mut flush_interval = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
@@ -144,6 +145,7 @@ async fn writer_loop(
                         if let Err(e) = writer.write_line(&formatted) {
                             tracing::error!(error = ?e, "Failed to write log line");
                         }
+                        let _ = broadcast_tx.send(formatted);
                     }
                     None => {
                         let _ = writer.flush();

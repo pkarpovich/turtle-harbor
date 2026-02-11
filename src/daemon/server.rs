@@ -1,9 +1,7 @@
 use crate::common::error::Result;
 use crate::common::ipc::{self, Command, Profile, Response};
-use crate::daemon::daemon_core::{DaemonCore, DaemonEvent};
-use crate::daemon::log_monitor;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use crate::daemon::daemon_core::{DaemonCore, DaemonEvent, LogChannels};
+use std::path::PathBuf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
@@ -11,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 pub struct Server {
     socket_path: PathBuf,
     daemon_core: DaemonCore,
+    log_channels: LogChannels,
 }
 
 impl Server {
@@ -31,20 +30,22 @@ impl Server {
         };
 
         let daemon_core = DaemonCore::new(state_file, log_dir)?;
+        let log_channels = daemon_core.log_channels();
         tracing::info!("DaemonCore initialized successfully");
 
         Ok(Self {
             socket_path: PathBuf::from(ipc::get_socket_path()),
             daemon_core,
+            log_channels,
         })
     }
 
     pub async fn run(&mut self) -> Result<()> {
         let listener = self.setup_listener()?;
         let event_tx = self.daemon_core.event_tx();
-        let log_dir = self.daemon_core.log_dir().to_path_buf();
+        let log_channels = self.log_channels.clone();
 
-        tokio::spawn(accept_loop(listener, event_tx.clone(), log_dir));
+        tokio::spawn(accept_loop(listener, event_tx.clone(), log_channels));
         tokio::spawn(signal_handler(event_tx));
 
         self.daemon_core.run().await?;
@@ -70,15 +71,15 @@ impl Server {
 async fn accept_loop(
     listener: UnixListener,
     event_tx: mpsc::Sender<DaemonEvent>,
-    log_dir: PathBuf,
+    log_channels: LogChannels,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 tracing::debug!(addr = ?addr, "Accepted new connection");
                 let tx = event_tx.clone();
-                let ld = log_dir.clone();
-                tokio::spawn(handle_client(stream, tx, ld));
+                let lc = log_channels.clone();
+                tokio::spawn(handle_client(stream, tx, lc));
             }
             Err(e) => {
                 tracing::error!(error = ?e, "Accept error");
@@ -91,7 +92,7 @@ async fn accept_loop(
 async fn handle_client(
     mut stream: UnixStream,
     event_tx: mpsc::Sender<DaemonEvent>,
-    log_dir: PathBuf,
+    log_channels: LogChannels,
 ) {
     while let Ok(command) = ipc::receive_command(&mut stream).await {
         tracing::info!(command = ?command, "Received command");
@@ -126,49 +127,42 @@ async fn handle_client(
         }
 
         if let Some(name) = follow_name {
-            follow_log_file(&mut stream, &log_dir, &name).await;
+            follow_via_broadcast(&mut stream, &log_channels, &name).await;
             break;
         }
     }
 }
 
-async fn follow_log_file(stream: &mut UnixStream, log_dir: &Path, name: &str) {
-    let log_path = log_monitor::get_log_path(log_dir, name);
-    let mut last_size: u64 = std::fs::metadata(&log_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+async fn follow_via_broadcast(stream: &mut UnixStream, log_channels: &LogChannels, name: &str) {
+    let rx = log_channels
+        .lock()
+        .ok()
+        .and_then(|channels| channels.get(name).map(|tx| tx.subscribe()));
+    let mut rx = match rx {
+        Some(rx) => rx,
+        None => {
+            let response = Response::Error(format!("No active log channel for '{}'", name));
+            let _ = ipc::send_response(stream, &response).await;
+            return;
+        }
+    };
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let current_size = match std::fs::metadata(&log_path) {
-            Ok(m) => m.len(),
-            Err(_) => continue,
-        };
-
-        if current_size <= last_size {
-            continue;
-        }
-
-        let chunk = match read_file_range(&log_path, last_size, current_size) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        last_size = current_size;
-
-        let response = Response::Logs(chunk);
-        if ipc::send_response(stream, &response).await.is_err() {
-            break;
+        match rx.recv().await {
+            Ok(line) => {
+                let response = Response::Logs(line);
+                if ipc::send_response(stream, &response).await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(script = %name, skipped = n, "Follow client lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                break;
+            }
         }
     }
-}
-
-fn read_file_range(path: &Path, from: u64, to: u64) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(from))?;
-    let mut buf = vec![0u8; (to - from) as usize];
-    file.read_exact(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
 async fn signal_handler(event_tx: mpsc::Sender<DaemonEvent>) {
