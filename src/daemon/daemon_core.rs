@@ -73,6 +73,15 @@ impl DaemonCore {
         self.log_channels.clone()
     }
 
+    fn register_log_channel(&self, name: &str) -> broadcast::Sender<String> {
+        let (tx, _) = broadcast::channel(256);
+        self.log_channels
+            .lock()
+            .expect("log_channels mutex poisoned")
+            .insert(name.to_string(), tx.clone());
+        tx
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         self.restore_state().await?;
         tracing::info!("Daemon core event loop started");
@@ -138,31 +147,31 @@ impl DaemonCore {
         }
     }
 
-    async fn handle_process_exit(&mut self, name: &str, status: Option<ExitStatus>) {
-        let script_def = self.config.script(name);
-        let should_restart = match &status {
-            Some(s) if s.success() => {
-                tracing::info!(script = %name, "Process exited successfully");
-                false
-            }
-            Some(s) => {
-                let code = s.code().unwrap_or(-1);
-                tracing::warn!(script = %name, exit_code = code, "Process exited with error");
-                match (script_def, self.supervisor.get(name)) {
-                    (Some(def), Some(proc)) => {
-                        matches!(def.restart_policy, RestartPolicy::Always)
-                            && proc.restart_count < def.max_restarts
-                    }
-                    _ => false,
-                }
-            }
-            None => {
-                tracing::info!(script = %name, "Process terminated by signal");
-                false
-            }
+    fn should_restart(&self, name: &str, status: &Option<ExitStatus>) -> bool {
+        let Some(exit_status) = status else {
+            tracing::info!(script = %name, "Process terminated by signal");
+            return false;
         };
 
-        if !should_restart {
+        if exit_status.success() {
+            tracing::info!(script = %name, "Process exited successfully");
+            return false;
+        }
+
+        let code = exit_status.code().unwrap_or(-1);
+        tracing::warn!(script = %name, exit_code = code, "Process exited with error");
+
+        match (self.config.script(name), self.supervisor.get(name)) {
+            (Some(def), Some(proc)) => {
+                matches!(def.restart_policy, RestartPolicy::Always)
+                    && proc.restart_count < def.max_restarts
+            }
+            _ => false,
+        }
+    }
+
+    async fn handle_process_exit(&mut self, name: &str, status: Option<ExitStatus>) {
+        if !self.should_restart(name, &status) {
             self.supervisor.cleanup_process(name);
             return;
         }
@@ -181,11 +190,7 @@ impl DaemonCore {
 
         if let Some(count) = restart_count {
             if let Some(script_def) = self.config.script(name).cloned() {
-                let (broadcast_tx, _) = broadcast::channel(256);
-                self.log_channels
-                    .lock()
-                    .unwrap()
-                    .insert(name.to_string(), broadcast_tx.clone());
+                let broadcast_tx = self.register_log_channel(name);
                 if let Err(e) = self.supervisor.start_script(name, &script_def, broadcast_tx) {
                     tracing::error!(script = %name, error = ?e, "Failed to restart");
                 } else if let Some(proc) = self.supervisor.get_mut(name) {
@@ -205,17 +210,16 @@ impl DaemonCore {
             None => return,
         };
 
-        let (broadcast_tx, _) = broadcast::channel(256);
-        self.log_channels
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), broadcast_tx.clone());
+        let broadcast_tx = self.register_log_channel(name);
         match self.supervisor.start_script(name, &script_def, broadcast_tx) {
             Ok(ScriptStartResult::Started) => {
                 tracing::info!(script = %name, "Cron-triggered script started");
-                let _ = self
+                if let Err(e) = self
                     .update_script_state(name, ProcessStatus::Running, false)
-                    .await;
+                    .await
+                {
+                    tracing::error!(script = %name, error = ?e, "Failed to update state after cron start");
+                }
             }
             Ok(ScriptStartResult::AlreadyRunning) => {
                 tracing::debug!(script = %name, "Cron tick - script already running");
@@ -260,11 +264,7 @@ impl DaemonCore {
             .clone();
 
         let cron = script_def.cron.clone();
-        let (broadcast_tx, _) = broadcast::channel(256);
-        self.log_channels
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), broadcast_tx.clone());
+        let broadcast_tx = self.register_log_channel(name);
         let result = self.supervisor.start_script(name, &script_def, broadcast_tx)?;
 
         if matches!(result, ScriptStartResult::Started) {
@@ -298,7 +298,7 @@ impl DaemonCore {
         }
 
         self.supervisor.stop_script(name).await?;
-        self.log_channels.lock().unwrap().remove(name);
+        self.log_channels.lock().expect("log_channels mutex poisoned").remove(name);
         self.cron.cancel(name);
         tracing::info!(script = %name, "Script stopped successfully");
         Ok(())
@@ -307,7 +307,7 @@ impl DaemonCore {
     async fn shutdown(&mut self) -> Result<()> {
         self.supervisor.shutdown_all().await;
         self.cron.cancel_all();
-        self.log_channels.lock().unwrap().clear();
+        self.log_channels.lock().expect("log_channels mutex poisoned").clear();
         Ok(())
     }
 
@@ -413,7 +413,7 @@ impl DaemonCore {
 
         let script_state = ScriptState {
             name: name.to_string(),
-            status: status.clone(),
+            status,
             last_started: start_time,
             last_stopped: if matches!(status, ProcessStatus::Stopped | ProcessStatus::Failed) {
                 Some(Local::now())
@@ -436,20 +436,28 @@ impl DaemonCore {
 
         for name in diff.removed {
             tracing::info!(script = %name, "Script removed from config, stopping");
-            let _ = self.stop_script(&name).await;
+            if let Err(e) = self.stop_script(&name).await {
+                tracing::error!(script = %name, error = ?e, "Failed to stop during reload");
+            }
             self.state.remove_script(&name).await?;
         }
 
         for name in diff.added {
             tracing::info!(script = %name, "New script in config, starting");
-            let _ = self.start_script(&name).await;
+            if let Err(e) = self.start_script(&name).await {
+                tracing::error!(script = %name, error = ?e, "Failed to start during reload");
+            }
         }
 
         for name in diff.changed {
             tracing::info!(script = %name, "Script config changed, restarting");
-            let _ = self.stop_script(&name).await;
+            if let Err(e) = self.stop_script(&name).await {
+                tracing::error!(script = %name, error = ?e, "Failed to stop during reload");
+            }
             self.cron.cancel(&name);
-            let _ = self.start_script(&name).await;
+            if let Err(e) = self.start_script(&name).await {
+                tracing::error!(script = %name, error = ?e, "Failed to start during reload");
+            }
         }
 
         tracing::info!("Configuration reloaded");

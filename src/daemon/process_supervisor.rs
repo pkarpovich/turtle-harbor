@@ -59,6 +59,8 @@ impl ProcessSupervisor {
         log_monitor::ensure_log_dir(&self.log_dir)?;
         let logger = ScriptLogger::new(log_path, broadcast_tx)?;
 
+        // SAFETY: pre_exec runs setpgid(0,0) in the forked child before exec — this is
+        // async-signal-safe per POSIX and only affects the child process
         let mut child = unsafe {
             TokioCommand::new("sh")
                 .arg("-c")
@@ -113,6 +115,7 @@ impl ProcessSupervisor {
         if let Some(mut process) = self.processes.remove(name) {
             if process.pid > 0 && is_process_alive(process.pid) {
                 let pgid = process.pid as i32;
+                // SAFETY: pgid is a valid process group ID set via setpgid in pre_exec
                 unsafe { libc::killpg(pgid, libc::SIGTERM) };
 
                 if let Some(watcher) = process.watcher.take() {
@@ -120,6 +123,7 @@ impl ProcessSupervisor {
                         Ok(_) => tracing::debug!(script = %name, "Process group exited after SIGTERM"),
                         Err(_) => {
                             tracing::warn!(script = %name, "SIGTERM timeout, sending SIGKILL to process group");
+                            // SAFETY: same pgid, escalating to SIGKILL after SIGTERM timeout
                             unsafe { libc::killpg(pgid, libc::SIGKILL) };
                         }
                     }
@@ -156,10 +160,12 @@ impl ProcessSupervisor {
 
                 if process.pid > 0 && is_process_alive(process.pid) {
                     let pgid = process.pid as i32;
+                    // SAFETY: pgid is a valid process group ID set via setpgid in pre_exec
                     unsafe { libc::killpg(pgid, libc::SIGTERM) };
                     tokio::time::sleep(Duration::from_millis(100)).await;
 
                     if is_process_alive(process.pid) {
+                        // SAFETY: same pgid, escalating to SIGKILL after SIGTERM timeout
                         unsafe { libc::killpg(pgid, libc::SIGKILL) };
                     }
                 }
@@ -192,7 +198,7 @@ impl ProcessSupervisor {
                 ProcessInfo {
                     name: name.clone(),
                     pid: process.pid,
-                    status: process.status.clone(),
+                    status: process.status,
                     uptime,
                     restart_count: process.restart_count,
                 }

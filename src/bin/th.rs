@@ -63,7 +63,7 @@ fn print_process_list_table(processes: &[ProcessInfo]) {
             "{:<20} {:<6} {:<10} {:<10} {:<8}",
             process.name,
             process.pid,
-            format_status(process.status.clone()),
+            format_status(process.status),
             format_duration(process.uptime),
             process.restart_count
         );

@@ -21,5 +21,6 @@ pub fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    // SAFETY: kill(pid, 0) is a standard POSIX liveness check — sends no signal, just tests existence
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }

@@ -78,7 +78,7 @@ impl ConfigManager {
         let removed = old_names.difference(&new_names).cloned().collect();
         let added = new_names.difference(&old_names).cloned().collect();
 
-        let new_scripts = &self.config.as_ref().unwrap().scripts;
+        let new_scripts = &self.config.as_ref().expect("config just replaced").scripts;
         let changed = old_names
             .intersection(&new_names)
             .filter(|name| old_config.scripts[*name] != new_scripts[*name])
