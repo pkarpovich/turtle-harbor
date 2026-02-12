@@ -27,3 +27,4 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time", "lo
 tracing-appender = "0.2.3"
 cron = "0.15.0"
 libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

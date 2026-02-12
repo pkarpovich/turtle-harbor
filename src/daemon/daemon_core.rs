@@ -5,6 +5,7 @@ use crate::daemon::config_manager::ConfigManager;
 use crate::daemon::cron_manager::CronManager;
 use crate::daemon::health::{self, HealthSnapshot, ScriptHealth, ScriptHealthState};
 use crate::daemon::log_monitor;
+use crate::daemon::loki_shipper::{self, LokiLogEntry, LokiShipper};
 use crate::daemon::process::ScriptStartResult;
 use crate::daemon::process_supervisor::ProcessSupervisor;
 use crate::daemon::state::{RunningState, ScriptState};
@@ -53,6 +54,7 @@ pub struct DaemonCore {
     event_rx: mpsc::Receiver<DaemonEvent>,
     log_channels: LogChannels,
     health: HealthSnapshot,
+    loki_tx: Option<mpsc::Sender<LokiLogEntry>>,
 }
 
 impl DaemonCore {
@@ -78,6 +80,7 @@ impl DaemonCore {
             event_rx,
             log_channels,
             health,
+            loki_tx: None,
         })
     }
 
@@ -135,9 +138,18 @@ impl DaemonCore {
         self.shutdown().await
     }
 
-    fn sync_log_dir(&mut self) {
+    fn sync_settings(&mut self) {
         if let Some(log_dir) = self.config.log_dir() {
             self.supervisor.set_log_dir(log_dir.to_path_buf());
+        }
+
+        if self.loki_tx.is_none() {
+            if let Some(loki_config) = self.config.loki_config().cloned() {
+                let (tx, rx) = mpsc::channel(loki_shipper::CHANNEL_CAPACITY);
+                LokiShipper::spawn(rx, loki_config);
+                self.supervisor.set_loki_tx(tx.clone());
+                self.loki_tx = Some(tx);
+            }
         }
     }
 
@@ -147,7 +159,7 @@ impl DaemonCore {
                 if let Err(e) = self.config.load(&config_path) {
                     return Response::Error(e.to_string());
                 }
-                self.sync_log_dir();
+                self.sync_settings();
                 self.state.config_path = Some(config_path);
                 match self.start_scripts(name).await {
                     Ok(_) => Response::Success,
@@ -512,7 +524,7 @@ impl DaemonCore {
                     tracing::warn!(error = ?e, "Failed to load config from state, skipping restore");
                     return Ok(());
                 }
-                self.sync_log_dir();
+                self.sync_settings();
             } else {
                 tracing::warn!(config = ?config_path, "Stored config path no longer exists, skipping restore");
                 return Ok(());
@@ -608,7 +620,7 @@ impl DaemonCore {
 
     async fn reload_config(&mut self) -> Result<()> {
         let diff = self.config.reload()?;
-        self.sync_log_dir();
+        self.sync_settings();
 
         for name in diff.removed {
             tracing::info!(script = %name, "Script removed from config, stopping");

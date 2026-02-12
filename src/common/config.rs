@@ -12,9 +12,18 @@ pub struct Config {
     pub scripts: HashMap<String, Script>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LokiConfig {
+    pub url: String,
+    #[serde(default)]
+    pub labels: Option<HashMap<String, String>>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub log_dir: PathBuf,
+    #[serde(default)]
+    pub loki: Option<LokiConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

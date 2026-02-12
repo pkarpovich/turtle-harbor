@@ -3,6 +3,7 @@ use crate::common::error::Result;
 use crate::common::ipc::{ProcessInfo, ProcessStatus};
 use crate::daemon::daemon_core::DaemonEvent;
 use crate::daemon::log_monitor::{self, ScriptLogger};
+use crate::daemon::loki_shipper::LokiLogEntry;
 use crate::daemon::process::{is_process_alive, ManagedProcess, ScriptStartResult};
 use chrono::Local;
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ pub struct ProcessSupervisor {
     processes: HashMap<String, ManagedProcess>,
     event_tx: mpsc::Sender<DaemonEvent>,
     log_dir: PathBuf,
+    loki_tx: Option<mpsc::Sender<LokiLogEntry>>,
 }
 
 impl ProcessSupervisor {
@@ -25,11 +27,16 @@ impl ProcessSupervisor {
             processes: HashMap::new(),
             event_tx,
             log_dir,
+            loki_tx: None,
         }
     }
 
     pub fn set_log_dir(&mut self, log_dir: PathBuf) {
         self.log_dir = log_dir;
+    }
+
+    pub fn set_loki_tx(&mut self, tx: mpsc::Sender<LokiLogEntry>) {
+        self.loki_tx = Some(tx);
     }
 
     pub fn log_dir(&self) -> &Path {
@@ -57,7 +64,7 @@ impl ProcessSupervisor {
 
         let log_path = log_monitor::get_log_path(&self.log_dir, name);
         log_monitor::ensure_log_dir(&self.log_dir)?;
-        let logger = ScriptLogger::new(log_path, broadcast_tx)?;
+        let logger = ScriptLogger::new(log_path, broadcast_tx, name.to_string(), self.loki_tx.clone())?;
 
         // SAFETY: pre_exec runs setpgid(0,0) in the forked child before exec — this is
         // async-signal-safe per POSIX and only affects the child process
