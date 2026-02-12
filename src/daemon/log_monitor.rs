@@ -8,6 +8,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 
 use crate::common::error::Result;
+use crate::daemon::loki_shipper::LokiLogEntry;
 
 const MAX_LINE_LENGTH: usize = 8192;
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -26,11 +27,16 @@ pub struct ScriptLogger {
 }
 
 impl ScriptLogger {
-    pub fn new(log_path: PathBuf, broadcast_tx: broadcast::Sender<String>) -> Result<Self> {
+    pub fn new(
+        log_path: PathBuf,
+        broadcast_tx: broadcast::Sender<String>,
+        script_name: String,
+        loki_tx: Option<mpsc::Sender<LokiLogEntry>>,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<LogLine>(CHANNEL_BUFFER);
 
         let writer_handle = tokio::spawn(async move {
-            if let Err(e) = writer_loop(rx, &log_path, broadcast_tx).await {
+            if let Err(e) = writer_loop(rx, &log_path, broadcast_tx, script_name, loki_tx).await {
                 tracing::error!(error = ?e, path = ?log_path, "Log writer error");
             }
         });
@@ -122,6 +128,8 @@ async fn writer_loop(
     mut rx: mpsc::Receiver<LogLine>,
     log_path: &Path,
     broadcast_tx: broadcast::Sender<String>,
+    script_name: String,
+    loki_tx: Option<mpsc::Sender<LokiLogEntry>>,
 ) -> std::io::Result<()> {
     let mut writer = RotatingWriter::new(log_path)?;
     let mut flush_interval = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
@@ -146,6 +154,14 @@ async fn writer_loop(
                             tracing::error!(error = ?e, "Failed to write log line");
                         }
                         let _ = broadcast_tx.send(formatted);
+                        if let Some(ref loki_tx) = loki_tx {
+                            let _ = loki_tx.try_send(LokiLogEntry {
+                                script: script_name.clone(),
+                                stream: stream.to_string(),
+                                timestamp: Local::now(),
+                                content: content.to_string(),
+                            });
+                        }
                     }
                     None => {
                         let _ = writer.flush();

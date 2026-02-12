@@ -4,6 +4,7 @@ mod daemon_core;
 pub mod health;
 mod http_server;
 mod log_monitor;
+mod loki_shipper;
 mod process;
 mod process_supervisor;
 mod scheduler;

@@ -1,4 +1,4 @@
-use crate::common::config::{Config, Script};
+use crate::common::config::{Config, LokiConfig, Script};
 use crate::common::error::{Error, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -52,6 +52,10 @@ impl ConfigManager {
 
     pub fn log_dir(&self) -> Option<&Path> {
         self.config.as_ref().map(|c| c.settings.log_dir.as_path())
+    }
+
+    pub fn loki_config(&self) -> Option<&LokiConfig> {
+        self.config.as_ref().and_then(|c| c.settings.loki.as_ref())
     }
 
     pub fn reload(&mut self) -> Result<ConfigDiff> {
