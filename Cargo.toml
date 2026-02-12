@@ -13,6 +13,7 @@ path = "src/bin/th.rs"
 
 [dependencies]
 anyhow = "1.0.95"
+axum = "0.8"
 chrono = { version = "0.4.39", features = ["serde"] }
 clap = { version = "4.5.27", features = ["derive"] }
 colored = "3.0.0"
