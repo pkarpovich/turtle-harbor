@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub type LogChannels = Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>;
@@ -26,10 +27,21 @@ pub enum DaemonEvent {
         name: String,
         status: Option<ExitStatus>,
     },
+    RestartAfterBackoff {
+        name: String,
+        restart_count: u32,
+    },
     CronTick {
         name: String,
     },
     Shutdown,
+}
+
+fn backoff_delay(attempt: u32) -> Duration {
+    let base_secs: u64 = 15;
+    let multiplier = 1u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX);
+    let secs = base_secs.saturating_mul(multiplier).min(300);
+    Duration::from_secs(secs)
 }
 
 pub struct DaemonCore {
@@ -103,6 +115,13 @@ impl DaemonCore {
                 DaemonEvent::ProcessExited { name, status } => {
                     self.handle_process_exit(&name, status).await;
                 }
+                DaemonEvent::RestartAfterBackoff {
+                    name,
+                    restart_count,
+                } => {
+                    self.handle_restart_after_backoff(&name, restart_count)
+                        .await;
+                }
                 DaemonEvent::CronTick { name } => {
                     self.handle_cron_tick(&name).await;
                 }
@@ -172,7 +191,7 @@ impl DaemonCore {
         match (self.config.script(name), self.supervisor.get(name)) {
             (Some(def), Some(proc)) => {
                 matches!(def.restart_policy, RestartPolicy::Always)
-                    && proc.restart_count < def.max_restarts
+                    && proc.restart_count < def.effective_max_restarts()
             }
             _ => false,
         }
@@ -181,6 +200,12 @@ impl DaemonCore {
     async fn handle_process_exit(&mut self, name: &str, status: Option<ExitStatus>) {
         let exit_code = status.and_then(|s| s.code());
         let succeeded = status.map(|s| s.success()).unwrap_or(false);
+
+        if succeeded {
+            if let Some(proc) = self.supervisor.get_mut(name) {
+                proc.restart_count = 0;
+            }
+        }
 
         {
             let mut snapshot = self.health.write().await;
@@ -216,24 +241,70 @@ impl DaemonCore {
 
         let restart_count = self.supervisor.get_mut(name).map(|p| {
             p.restart_count += 1;
-            tracing::info!(
-                script = %name,
-                restart_count = p.restart_count,
-                "Initiating restart"
-            );
             p.restart_count
         });
 
         self.supervisor.cleanup_process(name);
 
         if let Some(count) = restart_count {
-            if let Some(script_def) = self.config.script(name).cloned() {
-                let broadcast_tx = self.register_log_channel(name);
-                if let Err(e) = self.supervisor.start_script(name, &script_def, broadcast_tx) {
-                    tracing::error!(script = %name, error = ?e, "Failed to restart");
-                } else if let Some(proc) = self.supervisor.get_mut(name) {
-                    proc.restart_count = count;
+            let delay = backoff_delay(count);
+            tracing::info!(
+                script = %name,
+                restart_count = count,
+                delay_secs = delay.as_secs(),
+                "Scheduling restart after backoff"
+            );
+
+            let event_tx = self.event_tx.clone();
+            let owned_name = name.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = event_tx
+                    .send(DaemonEvent::RestartAfterBackoff {
+                        name: owned_name,
+                        restart_count: count,
+                    })
+                    .await;
+            });
+        }
+    }
+
+    async fn handle_restart_after_backoff(&mut self, name: &str, restart_count: u32) {
+        if !self.config.has_script(name) {
+            tracing::info!(script = %name, "Skipping backoff restart - script removed from config");
+            return;
+        }
+
+        if self.supervisor.contains(name) {
+            tracing::info!(script = %name, "Skipping backoff restart - script already running");
+            return;
+        }
+
+        let script_def = match self.config.script(name).cloned() {
+            Some(def) => def,
+            None => return,
+        };
+
+        tracing::info!(script = %name, restart_count, "Executing restart after backoff");
+        let broadcast_tx = self.register_log_channel(name);
+        match self.supervisor.start_script(name, &script_def, broadcast_tx) {
+            Ok(ScriptStartResult::Started) => {
+                if let Some(proc) = self.supervisor.get_mut(name) {
+                    proc.restart_count = restart_count;
                 }
+                self.update_health_on_start(name).await;
+                if let Err(e) = self
+                    .update_script_state(name, ProcessStatus::Running, false, None)
+                    .await
+                {
+                    tracing::error!(script = %name, error = ?e, "Failed to persist state after backoff restart");
+                }
+            }
+            Ok(ScriptStartResult::AlreadyRunning) => {
+                tracing::debug!(script = %name, "Backoff restart - script already running");
+            }
+            Err(e) => {
+                tracing::error!(script = %name, error = ?e, "Failed to restart after backoff");
             }
         }
     }

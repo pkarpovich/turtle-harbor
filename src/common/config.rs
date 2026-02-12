@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+const DEFAULT_MAX_RESTARTS: u32 = 5;
+const DEFAULT_MAX_RESTARTS_CRON: u32 = 3;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub settings: Settings,
@@ -18,8 +21,19 @@ pub struct Settings {
 pub struct Script {
     pub command: String,
     pub restart_policy: RestartPolicy,
-    pub max_restarts: u32,
+    #[serde(default)]
+    pub max_restarts: Option<u32>,
     pub cron: Option<String>,
+}
+
+impl Script {
+    pub fn effective_max_restarts(&self) -> u32 {
+        self.max_restarts.unwrap_or(if self.cron.is_some() {
+            DEFAULT_MAX_RESTARTS_CRON
+        } else {
+            DEFAULT_MAX_RESTARTS
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
