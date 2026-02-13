@@ -1,8 +1,10 @@
 # Turtle Harbor
 
-Turtle Harbor is a macOS daemon for managing scripts with automatic restart capabilities and cron scheduling. It
+Turtle Harbor is a daemon for managing scripts with automatic restart capabilities and cron scheduling. It
 provides a Docker-like experience with familiar CLI commands (`th up`, `th down`, `th ps`) and YAML configuration,
 making it easy to manage local scripts and processes with the same patterns you use for containers.
+
+Supports macOS (ARM/Intel) and Linux (ARM/x86).
 
 ## Features
 
@@ -12,13 +14,23 @@ making it easy to manage local scripts and processes with the same patterns you 
 - Per-script logging
 - Robust state management
 - Simple CLI interface
+- Cross-platform service install (`th install` / `th uninstall`)
 
 ## Installation
 
-### Via Homebrew
+### Via Homebrew (macOS)
 
 ```bash
 brew install pkarpovich/apps/turtle-harbor
+```
+
+### From GitHub Releases
+
+Download the latest release for your platform from [Releases](https://github.com/pkarpovich/turtle-harbor/releases), then extract and place `th` and `turtled` on your `PATH`:
+
+```bash
+tar -xzf turtle-harbor-*.tar.gz
+sudo mv th turtled /usr/local/bin/
 ```
 
 ### From Source
@@ -48,11 +60,17 @@ scripts:
 ### Managing the Daemon
 
 ```bash
-# Start the daemon
-turtled
+# Install as a system service (starts on boot)
+th install
 
-# Or using brew services
-brew services start turtle-harbor
+# With HTTP health endpoint
+th install --http-port 8080
+
+# Remove the system service
+th uninstall
+
+# Or run the daemon directly
+turtled
 ```
 
 ### CLI Commands
@@ -90,19 +108,23 @@ th logs backend
 - `always`: Automatically restart on failure
 - `never`: No automatic restart
 
-## Logging
+## File Locations
 
-Logs are stored in:
+### Production
 
-- Development: `./logs/{script_name}.log`
-- Production: `/opt/homebrew/var/log/turtle-harbor/{script_name}.log`
+| Path | macOS | Linux |
+|------|-------|-------|
+| Socket | `~/Library/Application Support/turtle-harbor/daemon.sock` | `$XDG_RUNTIME_DIR/turtle-harbor.sock` |
+| State | `~/Library/Application Support/turtle-harbor/state.json` | `~/.local/share/turtle-harbor/state.json` |
+| Logs | `~/Library/Logs/turtle-harbor/` | `~/.local/share/turtle-harbor/logs/` |
 
-## State Management
+### Development
 
-State is persisted in:
-
-- Development: `/tmp/turtle-harbor-state.json`
-- Production: `/opt/homebrew/var/lib/turtle-harbor/state.json`
+| Path | Location |
+|------|----------|
+| Socket | `/tmp/turtle-harbor.sock` |
+| State | `/tmp/turtle-harbor-state.json` |
+| Logs | `./logs/` |
 
 ## Contributing
 
@@ -117,19 +139,14 @@ State is persisted in:
 ### Prerequisites
 
 - Rust (latest stable)
-- macOS
+- macOS or Linux
 - Cargo
 
 ### Building
 
 ```bash
-# Install dependencies
 cargo fetch
-
-# Build in debug mode
 cargo build
-
-# Build in release mode
 cargo build --release
 ```
 

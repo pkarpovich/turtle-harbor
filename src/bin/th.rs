@@ -3,7 +3,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
 use std::time::Duration;
-use turtle_harbor::client::commands;
+use turtle_harbor::client::{commands, service};
 use turtle_harbor::client::error::handle_error;
 use turtle_harbor::common::error::Error;
 use turtle_harbor::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
@@ -30,6 +30,11 @@ pub enum Commands {
         follow: bool,
     },
     Reload,
+    Install {
+        #[arg(long)]
+        http_port: Option<u16>,
+    },
+    Uninstall,
 }
 
 pub fn format_duration(duration: Duration) -> String {
@@ -160,6 +165,12 @@ async fn run(cli: Cli) -> Result<()> {
                 Response::Error(e) => eprintln!("Reload error: {}", e),
                 _ => eprintln!("Unexpected response"),
             }
+        }
+        Commands::Install { http_port } => {
+            service::install(http_port)?;
+        }
+        Commands::Uninstall => {
+            service::uninstall()?;
         }
     }
 
