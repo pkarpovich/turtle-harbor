@@ -1,5 +1,6 @@
 use crate::common::error::Result;
-use crate::common::ipc::{self, Command, Profile, Response};
+use crate::common::ipc::{self, Command, Response};
+use crate::common::paths;
 use crate::daemon::daemon_core::{DaemonCore, DaemonEvent, LogChannels};
 use crate::daemon::health::HealthSnapshot;
 use crate::daemon::http_server;
@@ -21,19 +22,9 @@ pub struct Server {
 impl Server {
     pub fn new(http_port: Option<u16>, http_bind: String) -> Result<Self> {
         tracing::info!("Starting server initialization");
-        let brew_var =
-            std::env::var("HOMEBREW_VAR").unwrap_or_else(|_| "/opt/homebrew/var".to_string());
-        let state_file = match Profile::current() {
-            Profile::Development => PathBuf::from("/tmp/turtle-harbor-state.json"),
-            Profile::Production => {
-                PathBuf::from(format!("{}/lib/turtle-harbor/state.json", brew_var))
-            }
-        };
 
-        let log_dir = match Profile::current() {
-            Profile::Development => PathBuf::from("logs"),
-            Profile::Production => PathBuf::from(format!("{}/log/turtle-harbor", brew_var)),
-        };
+        let state_file = paths::state_file();
+        let log_dir = paths::log_dir();
 
         let daemon_core = DaemonCore::new(state_file, log_dir)?;
         let log_channels = daemon_core.log_channels();
@@ -42,7 +33,7 @@ impl Server {
         tracing::info!("DaemonCore initialized successfully");
 
         Ok(Self {
-            socket_path: PathBuf::from(ipc::get_socket_path()),
+            socket_path: paths::socket_path(),
             daemon_core,
             log_channels,
             health,
@@ -84,6 +75,9 @@ impl Server {
     }
 
     fn setup_listener(&self) -> Result<UnixListener> {
+        if let Some(parent) = self.socket_path.parent() {
+            paths::ensure_dir(parent)?;
+        }
         if self.socket_path.exists() {
             tracing::info!(path = ?self.socket_path, "Removing existing socket file");
             std::fs::remove_file(&self.socket_path)?;
