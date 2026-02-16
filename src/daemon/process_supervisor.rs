@@ -220,6 +220,7 @@ impl ProcessSupervisor {
                     status: process.status,
                     uptime,
                     restart_count: process.restart_count,
+                    exit_code: None,
                 }
             })
             .collect()

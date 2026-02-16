@@ -44,6 +44,8 @@ pub struct ProcessInfo {
     pub status: ProcessStatus,
     pub uptime: Duration,
     pub restart_count: u32,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -51,6 +53,7 @@ pub enum ProcessStatus {
     Running,
     Stopped,
     Failed,
+    Restarting,
 }
 
 async fn send_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<()> {
