@@ -10,7 +10,7 @@ use crate::daemon::process::ScriptStartResult;
 use crate::daemon::process_supervisor::ProcessSupervisor;
 use crate::daemon::state::{RunningState, ScriptState};
 use chrono::Local;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -157,15 +157,18 @@ impl DaemonCore {
         let mut result: HashMap<String, ProcessInfo> = HashMap::new();
 
         for script in &self.state.scripts {
-            let uptime = script
-                .last_started
-                .map(|st| {
-                    Local::now()
-                        .signed_duration_since(st)
-                        .to_std()
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
+            let uptime = match script.status {
+                ProcessStatus::Running | ProcessStatus::Restarting => script
+                    .last_started
+                    .map(|st| {
+                        Local::now()
+                            .signed_duration_since(st)
+                            .to_std()
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default(),
+                _ => Duration::default(),
+            };
 
             result.insert(
                 script.name.clone(),
@@ -430,9 +433,14 @@ impl DaemonCore {
         let names: Vec<String> = match name {
             Some(name) => vec![name],
             None => {
-                let mut all: Vec<String> = self.supervisor.names();
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut all: Vec<String> = Vec::new();
+                for name in self.supervisor.names() {
+                    seen.insert(name.clone());
+                    all.push(name);
+                }
                 for s in &self.state.scripts {
-                    if !all.contains(&s.name) {
+                    if seen.insert(s.name.clone()) {
                         all.push(s.name.clone());
                     }
                 }

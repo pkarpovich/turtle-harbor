@@ -42,8 +42,5 @@ pub fn log_dir() -> PathBuf {
 }
 
 pub fn ensure_dir(path: &std::path::Path) -> std::io::Result<()> {
-    if !path.exists() {
-        std::fs::create_dir_all(path)?;
-    }
-    Ok(())
+    std::fs::create_dir_all(path)
 }

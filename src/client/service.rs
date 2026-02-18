@@ -9,7 +9,15 @@ const SERVICE_NAME: &str = "turtle-harbor";
 
 fn turtled_bin_path() -> PathBuf {
     let current_exe = std::env::current_exe().expect("unable to resolve current executable path");
-    current_exe.parent().unwrap().join("turtled")
+    current_exe
+        .parent()
+        .expect("executable has no parent directory")
+        .join("turtled")
+}
+
+#[cfg(target_os = "macos")]
+fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
 }
 
 #[cfg(target_os = "macos")]
@@ -123,7 +131,7 @@ fn install_platform(turtled: &std::path::Path, http_port: Option<u16>) -> anyhow
     if already_loaded {
         println!("Stopping existing service...");
         let _ = Command::new("launchctl")
-            .args(["bootout", &format!("gui/{}", unsafe { libc::getuid() }), plist.to_str().unwrap()])
+            .args(["bootout", &format!("gui/{}", current_uid()), plist.to_str().unwrap()])
             .status();
     }
 
@@ -132,7 +140,7 @@ fn install_platform(turtled: &std::path::Path, http_port: Option<u16>) -> anyhow
     println!("Wrote {}", plist.display());
 
     let status = Command::new("launchctl")
-        .args(["bootstrap", &format!("gui/{}", unsafe { libc::getuid() }), plist.to_str().unwrap()])
+        .args(["bootstrap", &format!("gui/{}", current_uid()), plist.to_str().unwrap()])
         .status()?;
 
     if !status.success() {
@@ -188,7 +196,7 @@ fn uninstall_platform() -> anyhow::Result<()> {
     }
 
     let _ = Command::new("launchctl")
-        .args(["bootout", &format!("gui/{}", unsafe { libc::getuid() }), plist.to_str().unwrap()])
+        .args(["bootout", &format!("gui/{}", current_uid()), plist.to_str().unwrap()])
         .status();
 
     std::fs::remove_file(&plist)?;
