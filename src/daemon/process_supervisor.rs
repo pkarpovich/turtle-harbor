@@ -66,15 +66,27 @@ impl ProcessSupervisor {
         log_monitor::ensure_log_dir(&self.log_dir)?;
         let logger = ScriptLogger::new(log_path, broadcast_tx, name.to_string(), self.loki_tx.clone())?;
 
+        let mut cmd = TokioCommand::new("sh");
+        cmd.arg("-c")
+            .arg(&canonical_command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if let Some(context) = script_def.resolved_context() {
+            tracing::debug!(script = %name, context = %context.display(), "Setting working directory");
+            cmd.current_dir(&context);
+        }
+
+        let extra_env = script_def.resolved_env();
+        if !extra_env.is_empty() {
+            tracing::debug!(script = %name, env_keys = ?extra_env.keys().collect::<Vec<_>>(), "Injecting environment");
+            cmd.envs(&extra_env);
+        }
+
         // SAFETY: pre_exec runs setpgid(0,0) in the forked child before exec — this is
         // async-signal-safe per POSIX and only affects the child process
         let mut child = unsafe {
-            TokioCommand::new("sh")
-                .arg("-c")
-                .arg(&canonical_command)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .pre_exec(|| {
+            cmd.pre_exec(|| {
                     libc::setpgid(0, 0);
                     Ok(())
                 })
@@ -208,6 +220,7 @@ impl ProcessSupervisor {
                     status: process.status,
                     uptime,
                     restart_count: process.restart_count,
+                    exit_code: None,
                 }
             })
             .collect()

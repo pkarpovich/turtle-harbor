@@ -3,7 +3,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
 use std::time::Duration;
-use turtle_harbor::client::commands;
+use turtle_harbor::client::{commands, service};
 use turtle_harbor::client::error::handle_error;
 use turtle_harbor::common::error::Error;
 use turtle_harbor::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
@@ -30,6 +30,11 @@ pub enum Commands {
         follow: bool,
     },
     Reload,
+    Install {
+        #[arg(long)]
+        http_port: Option<u16>,
+    },
+    Uninstall,
 }
 
 pub fn format_duration(duration: Duration) -> String {
@@ -40,30 +45,44 @@ pub fn format_duration(duration: Duration) -> String {
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }
 
-pub fn format_status(status: ProcessStatus) -> ColoredString {
+pub fn format_status(status: ProcessStatus, exit_code: Option<i32>) -> ColoredString {
     match status {
         ProcessStatus::Running => "running".green(),
-        ProcessStatus::Stopped => "stopped".red(),
-        ProcessStatus::Failed => "failed".red().bold(),
+        ProcessStatus::Stopped => "exited (0)".dimmed(),
+        ProcessStatus::Restarting => "restarting".yellow(),
+        ProcessStatus::Failed => {
+            let code = exit_code.unwrap_or(-1);
+            format!("failed ({})", code).red().bold()
+        }
     }
 }
 
 fn print_process_list_table(processes: &[ProcessInfo]) {
+    if processes.is_empty() {
+        println!("No scripts registered. Run 'th up' to start scripts.");
+        return;
+    }
+
     println!(
-        "{:<20} {:<6} {:<10} {:<10} {:<8}",
+        "{:<20} {:<8} {:<16} {:<10} {:<8}",
         "NAME".bold(),
         "PID".bold(),
         "STATUS".bold(),
         "UPTIME".bold(),
         "RESTARTS".bold()
     );
-    println!("{}", "-".repeat(60));
+    println!("{}", "-".repeat(66));
     for process in processes {
+        let pid = if process.pid > 0 {
+            process.pid.to_string()
+        } else {
+            "-".to_string()
+        };
         println!(
-            "{:<20} {:<6} {:<10} {:<10} {:<8}",
+            "{:<20} {:<8} {:<16} {:<10} {:<8}",
             process.name,
-            process.pid,
-            format_status(process.status),
+            pid,
+            format_status(process.status, process.exit_code),
             format_duration(process.uptime),
             process.restart_count
         );
@@ -160,6 +179,12 @@ async fn run(cli: Cli) -> Result<()> {
                 Response::Error(e) => eprintln!("Reload error: {}", e),
                 _ => eprintln!("Unexpected response"),
             }
+        }
+        Commands::Install { http_port } => {
+            service::install(http_port)?;
+        }
+        Commands::Uninstall => {
+            service::uninstall()?;
         }
     }
 

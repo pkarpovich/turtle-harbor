@@ -20,19 +20,6 @@ impl Profile {
     }
 }
 
-pub fn get_socket_path() -> &'static str {
-    const PROD_SOCKET_PATH: &str = "/opt/homebrew/var/run/turtle-harbor.sock";
-    const DEV_SOCKET_PATH: &str = "/tmp/turtle-harbor.sock";
-
-    let current_profile = Profile::current();
-    let path = match current_profile {
-        Profile::Development => DEV_SOCKET_PATH,
-        Profile::Production => PROD_SOCKET_PATH,
-    };
-    tracing::debug!(socket_path = path, "Using socket path");
-    path
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Command {
     Up { name: Option<String>, config_path: std::path::PathBuf },
@@ -57,6 +44,8 @@ pub struct ProcessInfo {
     pub status: ProcessStatus,
     pub uptime: Duration,
     pub restart_count: u32,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -64,6 +53,7 @@ pub enum ProcessStatus {
     Running,
     Stopped,
     Failed,
+    Restarting,
 }
 
 async fn send_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<()> {

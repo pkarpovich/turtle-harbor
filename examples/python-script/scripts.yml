@@ -1,0 +1,12 @@
+settings:
+  log_dir: "./logs"
+
+scripts:
+  python-demo:
+    command: "python main.py"
+    context: "./examples/python-script"
+    venv: ".venv"
+    env:
+      PYTHONUNBUFFERED: "1"
+    restart_policy: "always"
+    max_restarts: 3

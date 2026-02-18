@@ -1,6 +1,6 @@
 use crate::common::config::RestartPolicy;
 use crate::common::error::{Error, Result};
-use crate::common::ipc::{Command, ProcessStatus, Response};
+use crate::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
 use crate::daemon::config_manager::ConfigManager;
 use crate::daemon::cron_manager::CronManager;
 use crate::daemon::health::{self, HealthSnapshot, ScriptHealth, ScriptHealthState};
@@ -10,7 +10,7 @@ use crate::daemon::process::ScriptStartResult;
 use crate::daemon::process_supervisor::ProcessSupervisor;
 use crate::daemon::state::{RunningState, ScriptState};
 use chrono::Local;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -153,6 +153,45 @@ impl DaemonCore {
         }
     }
 
+    fn full_status_list(&self) -> Vec<ProcessInfo> {
+        let mut result: HashMap<String, ProcessInfo> = HashMap::new();
+
+        for script in &self.state.scripts {
+            let uptime = match script.status {
+                ProcessStatus::Running | ProcessStatus::Restarting => script
+                    .last_started
+                    .map(|st| {
+                        Local::now()
+                            .signed_duration_since(st)
+                            .to_std()
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default(),
+                _ => Duration::default(),
+            };
+
+            result.insert(
+                script.name.clone(),
+                ProcessInfo {
+                    name: script.name.clone(),
+                    pid: 0,
+                    status: script.status,
+                    uptime,
+                    restart_count: script.restart_count,
+                    exit_code: script.exit_code,
+                },
+            );
+        }
+
+        for info in self.supervisor.status_list() {
+            result.insert(info.name.clone(), info);
+        }
+
+        let mut list: Vec<ProcessInfo> = result.into_values().collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
+    }
+
     async fn handle_command(&mut self, command: Command) -> Response {
         match command {
             Command::Up { name, config_path } => {
@@ -170,7 +209,7 @@ impl DaemonCore {
                 Ok(_) => Response::Success,
                 Err(e) => Response::Error(e.to_string()),
             },
-            Command::Ps => Response::ProcessList(self.supervisor.status_list()),
+            Command::Ps => Response::ProcessList(self.full_status_list()),
             Command::Logs {
                 name,
                 tail,
@@ -267,6 +306,13 @@ impl DaemonCore {
                 "Scheduling restart after backoff"
             );
 
+            if let Err(e) = self
+                .update_script_state(name, ProcessStatus::Restarting, false, exit_code)
+                .await
+            {
+                tracing::error!(script = %name, error = ?e, "Failed to persist restarting state");
+            }
+
             let event_tx = self.event_tx.clone();
             let owned_name = name.to_string();
             tokio::spawn(async move {
@@ -289,6 +335,16 @@ impl DaemonCore {
 
         if self.supervisor.contains(name) {
             tracing::info!(script = %name, "Skipping backoff restart - script already running");
+            return;
+        }
+
+        let was_stopped = self
+            .state
+            .scripts
+            .iter()
+            .any(|s| s.name == name && s.explicitly_stopped);
+        if was_stopped {
+            tracing::info!(script = %name, "Skipping backoff restart - script was explicitly stopped");
             return;
         }
 
@@ -376,7 +432,20 @@ impl DaemonCore {
     async fn stop_scripts(&mut self, name: Option<String>) -> Result<()> {
         let names: Vec<String> = match name {
             Some(name) => vec![name],
-            None => self.supervisor.names(),
+            None => {
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut all: Vec<String> = Vec::new();
+                for name in self.supervisor.names() {
+                    seen.insert(name.clone());
+                    all.push(name);
+                }
+                for s in &self.state.scripts {
+                    if seen.insert(s.name.clone()) {
+                        all.push(s.name.clone());
+                    }
+                }
+                all
+            }
         };
         for name in names {
             self.stop_script(&name).await?;
@@ -425,10 +494,8 @@ impl DaemonCore {
             });
         }
 
-        if self.supervisor.contains(name) {
-            self.update_script_state(name, ProcessStatus::Stopped, true, None)
-                .await?;
-        }
+        self.update_script_state(name, ProcessStatus::Stopped, true, None)
+            .await?;
 
         self.supervisor.stop_script(name).await?;
         self.log_channels.lock().expect("log_channels mutex poisoned").remove(name);
@@ -486,7 +553,7 @@ impl DaemonCore {
             let mut snapshot = self.health.write().await;
             for script in &self.state.scripts {
                 let state = match script.status {
-                    ProcessStatus::Running => ScriptHealthState::Running,
+                    ProcessStatus::Running | ProcessStatus::Restarting => ScriptHealthState::Running,
                     ProcessStatus::Failed => ScriptHealthState::Failed,
                     ProcessStatus::Stopped => {
                         if script.exit_code.is_some() {
@@ -536,7 +603,7 @@ impl DaemonCore {
 
         let scripts: Vec<ScriptState> = self.state.scripts.clone();
         for script in scripts {
-            if !matches!(script.status, ProcessStatus::Running) || script.explicitly_stopped {
+            if !matches!(script.status, ProcessStatus::Running | ProcessStatus::Restarting) || script.explicitly_stopped {
                 continue;
             }
             if !self.config.has_script(&script.name) {
