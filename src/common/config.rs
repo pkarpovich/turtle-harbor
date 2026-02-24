@@ -99,6 +99,52 @@ pub enum RestartPolicy {
     Never,
 }
 
+pub fn parse_env_file(path: &Path) -> HashMap<String, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("failed to read env file {}: {}", path.display(), e);
+            return HashMap::new();
+        }
+    };
+
+    let mut vars = HashMap::new();
+    for (line_num, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some(eq_pos) = trimmed.find('=') else {
+            tracing::warn!("env file {}: skipping malformed line {}: {}", path.display(), line_num + 1, trimmed);
+            continue;
+        };
+
+        let key = trimmed[..eq_pos].trim();
+        if key.is_empty() {
+            tracing::warn!("env file {}: skipping line {} with empty key", path.display(), line_num + 1);
+            continue;
+        }
+
+        let raw_value = trimmed[eq_pos + 1..].trim();
+        let value = if (raw_value.starts_with('"') && raw_value.ends_with('"'))
+            || (raw_value.starts_with('\'') && raw_value.ends_with('\''))
+        {
+            if raw_value.len() >= 2 {
+                &raw_value[1..raw_value.len() - 1]
+            } else {
+                raw_value
+            }
+        } else {
+            raw_value
+        };
+
+        vars.insert(key.to_string(), value.to_string());
+    }
+
+    vars
+}
+
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
@@ -108,5 +154,95 @@ impl Config {
         })?;
         let config = serde_yml::from_str(&content)?;
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn write_env_file(content: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    #[test]
+    fn parse_env_file_basic_key_value() {
+        let file = write_env_file("FOO=bar\nBAZ=qux\n");
+        let vars = parse_env_file(file.path());
+        assert_eq!(vars.get("FOO").unwrap(), "bar");
+        assert_eq!(vars.get("BAZ").unwrap(), "qux");
+        assert_eq!(vars.len(), 2);
+    }
+
+    #[test]
+    fn parse_env_file_comments_and_empty_lines() {
+        let file = write_env_file("# this is a comment\n\nFOO=bar\n\n# another comment\nBAZ=qux\n");
+        let vars = parse_env_file(file.path());
+        assert_eq!(vars.get("FOO").unwrap(), "bar");
+        assert_eq!(vars.get("BAZ").unwrap(), "qux");
+        assert_eq!(vars.len(), 2);
+    }
+
+    #[test]
+    fn parse_env_file_double_quoted_value() {
+        let file = write_env_file("SECRET=\"hello world\"\n");
+        let vars = parse_env_file(file.path());
+        assert_eq!(vars.get("SECRET").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn parse_env_file_single_quoted_value() {
+        let file = write_env_file("SECRET='hello world'\n");
+        let vars = parse_env_file(file.path());
+        assert_eq!(vars.get("SECRET").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn parse_env_file_empty_value() {
+        let file = write_env_file("EMPTY_VAR=\n");
+        let vars = parse_env_file(file.path());
+        assert_eq!(vars.get("EMPTY_VAR").unwrap(), "");
+    }
+
+    #[test]
+    fn parse_env_file_value_with_equals() {
+        let file = write_env_file("URL=http://example.com?foo=bar\n");
+        let vars = parse_env_file(file.path());
+        assert_eq!(vars.get("URL").unwrap(), "http://example.com?foo=bar");
+    }
+
+    #[test]
+    fn parse_env_file_malformed_lines_skipped() {
+        let file = write_env_file("GOOD=value\nNO_EQUALS_HERE\nALSO_GOOD=yes\n");
+        let vars = parse_env_file(file.path());
+        assert_eq!(vars.get("GOOD").unwrap(), "value");
+        assert_eq!(vars.get("ALSO_GOOD").unwrap(), "yes");
+        assert_eq!(vars.len(), 2);
+    }
+
+    #[test]
+    fn parse_env_file_empty_key_skipped() {
+        let file = write_env_file("=value\nGOOD=ok\n");
+        let vars = parse_env_file(file.path());
+        assert_eq!(vars.get("GOOD").unwrap(), "ok");
+        assert_eq!(vars.len(), 1);
+    }
+
+    #[test]
+    fn parse_env_file_nonexistent_file_returns_empty() {
+        let vars = parse_env_file(Path::new("/nonexistent/path/.env"));
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn parse_env_file_whitespace_around_key_value() {
+        let file = write_env_file("  KEY  =  value  \n");
+        let vars = parse_env_file(file.path());
+        assert_eq!(vars.get("KEY").unwrap(), "value");
     }
 }

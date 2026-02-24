@@ -31,16 +31,16 @@ Currently env vars can only be set inline in `scripts.yml` via the `env` field. 
 
 ### Task 1: Add env_file .env parser to config module
 
-- [ ] add `parse_env_file(path: &Path) -> HashMap<String, String>` to `src/common/config.rs`
+- [x] add `parse_env_file(path: &Path) -> HashMap<String, String>` to `src/common/config.rs`
   - reads file line by line
   - skips empty lines and `#` comments
   - parses `KEY=VALUE`, strips surrounding quotes (`"` and `'`) from values
   - handles `KEY=` (empty value) and `KEY` without `=` (skip)
   - logs warning on malformed lines, does not fail
-- [ ] write tests for parse_env_file: basic KEY=VALUE parsing
-- [ ] write tests for parse_env_file: comments, empty lines, quoted values, empty values
-- [ ] write tests for parse_env_file: malformed lines (no panic, returns partial result)
-- [ ] `cargo test` — must pass before task 2
+- [x] write tests for parse_env_file: basic KEY=VALUE parsing
+- [x] write tests for parse_env_file: comments, empty lines, quoted values, empty values
+- [x] write tests for parse_env_file: malformed lines (no panic, returns partial result)
+- [x] `cargo test` — must pass before task 2
 
 ### Task 2: Add env_file field to Script and integrate into resolved_env
 
