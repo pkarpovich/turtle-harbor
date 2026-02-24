@@ -30,12 +30,6 @@ pub enum Error {
         source: cron::error::Error,
     },
 
-    #[error("failed to read env file {path}: {source}")]
-    EnvFileRead {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
     #[error("no configuration loaded - run 'th up' first")]
     ConfigNotLoaded,
 

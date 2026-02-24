@@ -24,9 +24,6 @@ pub fn handle_error(error: Error) -> ! {
             expression,
             source,
         } => format!("Invalid cron '{}': {}", expression, source),
-        Error::EnvFileRead { path, source } => {
-            format!("Failed to read env file {}: {}", path.display(), source)
-        }
         Error::Json(e) => format!("JSON error: {}", e),
     };
 

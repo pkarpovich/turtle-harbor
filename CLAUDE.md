@@ -25,7 +25,7 @@ Turtle Harbor is a cross-platform daemon (macOS + Linux) for managing scripts wi
 ### Module Structure
 
 - **common/**: Shared code between client and daemon
-  - `config.rs`: YAML config parsing (`scripts.yml`)
+  - `config.rs`: YAML config parsing (`scripts.yml`), `.env` file parser, `resolved_env()` with priority: env_file < venv < inline env
   - `ipc.rs`: Unix socket protocol with `Command`/`Response` enums, `Profile` enum
   - `paths.rs`: Centralized cross-platform path resolution (socket, state, logs) using `dirs` crate
   - `error.rs`: Error types using `thiserror`
@@ -66,4 +66,7 @@ scripts:
     restart_policy: "always"  # or "never"
     max_restarts: 5
     cron: "0 */1 * * * * *"   # optional, 7-field cron expression
+    env_file: ".env"           # optional, loads KEY=VALUE pairs
+    env:                       # optional, overrides env_file values
+      LOG_LEVEL: "debug"
 ```

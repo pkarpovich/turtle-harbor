@@ -79,12 +79,6 @@ impl Script {
             }
         }
 
-        if let Some(user_env) = &self.env {
-            for (k, v) in user_env {
-                env_vars.insert(k.into(), v.into());
-            }
-        }
-
         if let Some(venv) = &self.venv {
             let venv_path = if venv.is_absolute() {
                 venv.clone()
@@ -102,6 +96,12 @@ impl Script {
             env_vars.insert("VIRTUAL_ENV".into(), venv_path.into_os_string());
         }
 
+        if let Some(user_env) = &self.env {
+            for (k, v) in user_env {
+                env_vars.insert(k.into(), v.into());
+            }
+        }
+
         env_vars
     }
 }
@@ -113,7 +113,7 @@ pub enum RestartPolicy {
     Never,
 }
 
-pub fn parse_env_file(path: &Path) -> HashMap<String, String> {
+fn parse_env_file(path: &Path) -> HashMap<String, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
@@ -141,14 +141,11 @@ pub fn parse_env_file(path: &Path) -> HashMap<String, String> {
         }
 
         let raw_value = trimmed[eq_pos + 1..].trim();
-        let value = if (raw_value.starts_with('"') && raw_value.ends_with('"'))
-            || (raw_value.starts_with('\'') && raw_value.ends_with('\''))
+        let value = if raw_value.len() >= 2
+            && ((raw_value.starts_with('"') && raw_value.ends_with('"'))
+                || (raw_value.starts_with('\'') && raw_value.ends_with('\'')))
         {
-            if raw_value.len() >= 2 {
-                &raw_value[1..raw_value.len() - 1]
-            } else {
-                raw_value
-            }
+            &raw_value[1..raw_value.len() - 1]
         } else {
             raw_value
         };
