@@ -10,3 +10,6 @@ scripts:
     command: "./examples/test_script.sh"
     restart_policy: "always"
     max_restarts: 5
+    env_file: ".env"
+    env:
+      LOG_LEVEL: "info"

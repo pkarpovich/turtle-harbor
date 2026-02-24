@@ -4,5 +4,8 @@ dist/
 .intentionally-empty-file.o
 target/
 
+# environment files with secrets
+.env
+
 # ralphex progress logs
 .ralphex/progress/

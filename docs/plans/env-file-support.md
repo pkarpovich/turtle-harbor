@@ -53,11 +53,11 @@ Currently env vars can only be set inline in `scripts.yml` via the `env` field. 
 
 ### Task 3: Update examples and verify
 
-- [ ] update `examples/scripts.yml` — add `env_file: ".env"` to radio-t-checker, remove RELAY_SECRET from inline env
-- [ ] create `scripts/.env.example` with placeholder keys
-- [ ] add `.env` to `.gitignore` if not already there
-- [ ] `cargo build` — must compile
-- [ ] `cargo test` — all tests pass
+- [x] update `examples/scripts.yml` — add `env_file: ".env"` to radio-t-checker, remove RELAY_SECRET from inline env
+- [x] create `scripts/.env.example` with placeholder keys
+- [x] add `.env` to `.gitignore` if not already there
+- [x] `cargo build` — must compile
+- [x] `cargo test` — all tests pass
 
 ## Technical Details
 
