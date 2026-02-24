@@ -3,3 +3,6 @@
 dist/
 .intentionally-empty-file.o
 target/
+
+# ralphex progress logs
+.ralphex/progress/

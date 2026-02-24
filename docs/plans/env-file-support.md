@@ -44,12 +44,12 @@ Currently env vars can only be set inline in `scripts.yml` via the `env` field. 
 
 ### Task 2: Add env_file field to Script and integrate into resolved_env
 
-- [ ] add `env_file: Option<PathBuf>` with `#[serde(default)]` to `Script` struct in `src/common/config.rs`
-- [ ] update `resolved_env()`: if `env_file` is Some, resolve path relative to context (or cwd), call `parse_env_file`, insert all entries first, then overlay inline `env` on top
-- [ ] add `EnvFileRead` variant to `src/common/error.rs` (for file not found — log warning but don't crash)
-- [ ] write tests for resolved_env with env_file: verify env_file vars loaded
-- [ ] write tests for resolved_env priority: inline env overrides env_file
-- [ ] `cargo test` — must pass before task 3
+- [x] add `env_file: Option<PathBuf>` with `#[serde(default)]` to `Script` struct in `src/common/config.rs`
+- [x] update `resolved_env()`: if `env_file` is Some, resolve path relative to context (or cwd), call `parse_env_file`, insert all entries first, then overlay inline `env` on top
+- [x] add `EnvFileRead` variant to `src/common/error.rs` (for file not found — log warning but don't crash)
+- [x] write tests for resolved_env with env_file: verify env_file vars loaded
+- [x] write tests for resolved_env priority: inline env overrides env_file
+- [x] `cargo test` — must pass before task 3
 
 ### Task 3: Update examples and verify
 
