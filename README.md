@@ -14,6 +14,7 @@ Supports macOS (ARM/Intel) and Linux (ARM/x86).
 - Per-script logging
 - Robust state management
 - Simple CLI interface
+- Environment file support (`.env`) for secrets management
 - Cross-platform service install (`th install` / `th uninstall`)
 
 ## Installation
@@ -55,6 +56,9 @@ scripts:
     restart_policy: "always"
     max_restarts: 5
     cron: "0 */1 * * * * *"
+    env_file: ".env"
+    env:
+      LOG_LEVEL: "info"
 ```
 
 ### Managing the Daemon
@@ -96,12 +100,25 @@ th logs backend
 
 ### Script Parameters
 
-| Parameter      | Description                    | Values            |
-|----------------|--------------------------------|-------------------|
-| command        | Command to execute             | String            |
-| restart_policy | Restart policy                 | "always", "never" |
-| max_restarts   | Maximum number of restarts     | Number            |
-| cron           | Cron expression for scheduling | String (optional) |
+| Parameter      | Description                              | Values            |
+|----------------|------------------------------------------|-------------------|
+| command        | Command to execute                       | String            |
+| restart_policy | Restart policy                           | "always", "never" |
+| max_restarts   | Maximum number of restarts               | Number (optional) |
+| cron           | Cron expression for scheduling           | String (optional) |
+| env_file       | Path to `.env` file for environment vars | String (optional) |
+| env            | Inline environment variables             | Map (optional)    |
+| context        | Working directory for the script         | String (optional) |
+| venv           | Python virtualenv path                   | String (optional) |
+
+### Environment Variables
+
+Scripts can receive environment variables from two sources:
+
+- **`env_file`**: Path to a `.env` file (relative to `context` or working directory). Supports `KEY=VALUE` pairs, `#` comments, empty lines, and single/double quoted values.
+- **`env`**: Inline key-value map in `scripts.yml`.
+
+When both are specified, inline `env` values override `env_file` values for the same key.
 
 ### Restart Policies
 
