@@ -33,6 +33,12 @@ impl ConfigManager {
         self.config.as_ref().ok_or(Error::ConfigNotLoaded)
     }
 
+    pub fn config_dir(&self) -> Option<PathBuf> {
+        self.config_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    }
+
     pub fn script(&self, name: &str) -> Option<&Script> {
         self.config.as_ref().and_then(|c| c.scripts.get(name))
     }

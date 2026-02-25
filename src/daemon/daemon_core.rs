@@ -138,9 +138,20 @@ impl DaemonCore {
         self.shutdown().await
     }
 
+    fn config_dir(&self) -> PathBuf {
+        self.config
+            .config_dir()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    }
+
     fn sync_settings(&mut self) {
         if let Some(log_dir) = self.config.log_dir() {
-            self.supervisor.set_log_dir(log_dir.to_path_buf());
+            let resolved = if log_dir.is_absolute() {
+                log_dir.to_path_buf()
+            } else {
+                self.config_dir().join(log_dir)
+            };
+            self.supervisor.set_log_dir(resolved);
         }
 
         if self.loki_tx.is_none() {
@@ -354,8 +365,9 @@ impl DaemonCore {
         };
 
         tracing::info!(script = %name, restart_count, "Executing restart after backoff");
+        let config_dir = self.config_dir();
         let broadcast_tx = self.register_log_channel(name);
-        match self.supervisor.start_script(name, &script_def, broadcast_tx) {
+        match self.supervisor.start_script(name, &script_def, broadcast_tx, &config_dir) {
             Ok(ScriptStartResult::Started) => {
                 if let Some(proc) = self.supervisor.get_mut(name) {
                     proc.restart_count = restart_count;
@@ -387,8 +399,9 @@ impl DaemonCore {
             None => return,
         };
 
+        let config_dir = self.config_dir();
         let broadcast_tx = self.register_log_channel(name);
-        match self.supervisor.start_script(name, &script_def, broadcast_tx) {
+        match self.supervisor.start_script(name, &script_def, broadcast_tx, &config_dir) {
             Ok(ScriptStartResult::Started) => {
                 tracing::info!(script = %name, "Cron-triggered script started");
                 self.update_health_on_start(name).await;
@@ -465,8 +478,9 @@ impl DaemonCore {
             .clone();
 
         let cron = script_def.cron.clone();
+        let config_dir = self.config_dir();
         let broadcast_tx = self.register_log_channel(name);
-        let result = self.supervisor.start_script(name, &script_def, broadcast_tx)?;
+        let result = self.supervisor.start_script(name, &script_def, broadcast_tx, &config_dir)?;
 
         if matches!(result, ScriptStartResult::Started) {
             self.update_health_on_start(name).await;

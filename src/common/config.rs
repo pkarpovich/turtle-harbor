@@ -53,19 +53,19 @@ impl Script {
         })
     }
 
-    pub fn resolved_context(&self) -> Option<PathBuf> {
+    pub fn resolved_context(&self, config_dir: &Path) -> Option<PathBuf> {
         self.context.as_ref().map(|p| {
             if p.is_absolute() {
                 p.clone()
             } else {
-                std::env::current_dir().unwrap_or_default().join(p)
+                config_dir.join(p)
             }
         })
     }
 
-    pub fn resolved_env(&self) -> HashMap<OsString, OsString> {
+    pub fn resolved_env(&self, config_dir: &Path) -> HashMap<OsString, OsString> {
         let mut env_vars: HashMap<OsString, OsString> = HashMap::new();
-        let base_dir = self.resolved_context().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let base_dir = self.resolved_context(config_dir).unwrap_or_else(|| config_dir.to_path_buf());
 
         if let Some(env_file) = &self.env_file {
             let env_file_path = if env_file.is_absolute() {
@@ -274,7 +274,7 @@ mod tests {
     fn resolved_env_loads_env_file_vars() {
         let file = write_env_file("API_KEY=secret123\nDB_HOST=localhost\n");
         let script = make_script_with_env_file(Some(file.path().to_path_buf()), None);
-        let env = script.resolved_env();
+        let env = script.resolved_env(Path::new("/tmp"));
         assert_eq!(env.get(&OsString::from("API_KEY")).unwrap(), "secret123");
         assert_eq!(env.get(&OsString::from("DB_HOST")).unwrap(), "localhost");
     }
@@ -287,7 +287,7 @@ mod tests {
         inline_env.insert("INLINE_ONLY".to_string(), "inline_val".to_string());
 
         let script = make_script_with_env_file(Some(file.path().to_path_buf()), Some(inline_env));
-        let env = script.resolved_env();
+        let env = script.resolved_env(Path::new("/tmp"));
 
         assert_eq!(env.get(&OsString::from("SHARED")).unwrap(), "from_inline");
         assert_eq!(env.get(&OsString::from("FILE_ONLY")).unwrap(), "file_val");
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn resolved_env_missing_env_file_continues() {
         let script = make_script_with_env_file(Some(PathBuf::from("/nonexistent/.env")), None);
-        let env = script.resolved_env();
+        let env = script.resolved_env(Path::new("/tmp"));
         assert!(env.is_empty());
     }
 
@@ -306,7 +306,7 @@ mod tests {
         let mut inline_env = HashMap::new();
         inline_env.insert("FOO".to_string(), "bar".to_string());
         let script = make_script_with_env_file(None, Some(inline_env));
-        let env = script.resolved_env();
+        let env = script.resolved_env(Path::new("/tmp"));
         assert_eq!(env.get(&OsString::from("FOO")).unwrap(), "bar");
         assert_eq!(env.len(), 1);
     }

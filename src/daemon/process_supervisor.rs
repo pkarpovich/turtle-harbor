@@ -43,7 +43,7 @@ impl ProcessSupervisor {
         &self.log_dir
     }
 
-    pub fn start_script(&mut self, name: &str, script_def: &Script, broadcast_tx: broadcast::Sender<String>) -> Result<ScriptStartResult> {
+    pub fn start_script(&mut self, name: &str, script_def: &Script, broadcast_tx: broadcast::Sender<String>, config_dir: &Path) -> Result<ScriptStartResult> {
         tracing::info!(
             script = %name,
             command = %script_def.command,
@@ -72,12 +72,12 @@ impl ProcessSupervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        if let Some(context) = script_def.resolved_context() {
+        if let Some(context) = script_def.resolved_context(config_dir) {
             tracing::debug!(script = %name, context = %context.display(), "Setting working directory");
             cmd.current_dir(&context);
         }
 
-        let extra_env = script_def.resolved_env();
+        let extra_env = script_def.resolved_env(config_dir);
         if !extra_env.is_empty() {
             tracing::debug!(script = %name, env_keys = ?extra_env.keys().collect::<Vec<_>>(), "Injecting environment");
             cmd.envs(&extra_env);
