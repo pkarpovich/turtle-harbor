@@ -102,20 +102,32 @@ fn extract_binaries(tar_gz_data: &[u8], dest: &Path) -> anyhow::Result<()> {
 fn stop_daemon() {
     let socket_path = crate::common::paths::socket_path();
     if !socket_path.exists() {
+        println!("Daemon not running (no socket)");
         return;
     }
 
-    println!("Stopping daemon...");
+    println!("Stopping scripts...");
     let bin = bin_dir().join("th");
     let _ = Command::new(&bin).arg("down").status();
 
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    println!("Stopping daemon...");
+    let _ = Command::new("pkill").arg("turtled").status();
 
-    let turtled = bin_dir().join("turtled");
-    let _ = Command::new("pkill")
-        .args(["-f", &turtled.to_string_lossy()])
-        .status();
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let alive = Command::new("pgrep")
+            .arg("turtled")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !alive {
+            println!("Daemon stopped");
+            return;
+        }
+    }
 
+    println!("Force killing daemon...");
+    let _ = Command::new("pkill").args(["-9", "turtled"]).status();
     std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
