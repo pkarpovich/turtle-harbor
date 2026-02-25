@@ -3,7 +3,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
 use std::time::Duration;
-use turtle_harbor::client::{commands, service};
+use turtle_harbor::client::{commands, service, updater};
 use turtle_harbor::client::error::handle_error;
 use turtle_harbor::common::error::Error;
 use turtle_harbor::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
@@ -35,6 +35,7 @@ pub enum Commands {
         http_port: Option<u16>,
     },
     Uninstall,
+    Update,
 }
 
 pub fn format_duration(duration: Duration) -> String {
@@ -185,6 +186,9 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Uninstall => {
             service::uninstall()?;
+        }
+        Commands::Update => {
+            updater::update().await?;
         }
     }
 

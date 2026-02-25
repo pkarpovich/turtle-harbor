@@ -29,6 +29,6 @@ cron = "0.15.0"
 dirs = "6.0"
 libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-
-[dev-dependencies]
+flate2 = "1"
+tar = "0.4"
 tempfile = "3"
