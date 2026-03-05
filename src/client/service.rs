@@ -42,6 +42,8 @@ fn generate_plist(turtled: &std::path::Path, http_port: Option<u16>) -> String {
         ));
     }
 
+    let path = std::env::var("PATH").unwrap_or_default();
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -53,6 +55,11 @@ fn generate_plist(turtled: &std::path::Path, http_port: Option<u16>) -> String {
     <array>
 {args}
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{path}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -66,6 +73,7 @@ fn generate_plist(turtled: &std::path::Path, http_port: Option<u16>) -> String {
 "#,
         label = LABEL,
         args = args,
+        path = path,
         log_dir = log_dir.display(),
     )
 }
@@ -85,6 +93,8 @@ fn generate_unit(turtled: &std::path::Path, http_port: Option<u16>) -> String {
         exec_start.push_str(&format!(" --http-port {}", port));
     }
 
+    let path = std::env::var("PATH").unwrap_or_default();
+
     format!(
         r#"[Unit]
 Description=Turtle Harbor daemon
@@ -93,6 +103,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart={exec_start}
+Environment=PATH={path}
 Restart=on-failure
 RestartSec=5
 
@@ -100,6 +111,7 @@ RestartSec=5
 WantedBy=default.target
 "#,
         exec_start = exec_start,
+        path = path,
     )
 }
 
