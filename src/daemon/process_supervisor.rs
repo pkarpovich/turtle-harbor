@@ -72,10 +72,11 @@ impl ProcessSupervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        if let Some(context) = script_def.resolved_context(config_dir) {
-            tracing::debug!(script = %name, context = %context.display(), "Setting working directory");
-            cmd.current_dir(&context);
-        }
+        let working_dir = script_def
+            .resolved_context(config_dir)
+            .unwrap_or_else(|| config_dir.to_path_buf());
+        tracing::debug!(script = %name, working_dir = %working_dir.display(), "Setting working directory");
+        cmd.current_dir(&working_dir);
 
         let extra_env = script_def.resolved_env(config_dir);
         if !extra_env.is_empty() {
@@ -221,6 +222,7 @@ impl ProcessSupervisor {
                     uptime,
                     restart_count: process.restart_count,
                     exit_code: None,
+                    config_path: None,
                 }
             })
             .collect()

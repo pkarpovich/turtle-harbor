@@ -23,10 +23,10 @@ impl Profile {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Command {
     Up { name: Option<String>, config_path: std::path::PathBuf },
-    Down { name: Option<String> },
-    Ps,
+    Down { name: Option<String>, config_path: std::path::PathBuf },
+    Ps { config_path: Option<std::path::PathBuf> },
     Logs { name: Option<String>, tail: u32, follow: bool },
-    Reload,
+    Reload { config_path: std::path::PathBuf },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -46,6 +46,8 @@ pub struct ProcessInfo {
     pub restart_count: u32,
     #[serde(default)]
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]

@@ -11,7 +11,7 @@ use crate::daemon::process_supervisor::ProcessSupervisor;
 use crate::daemon::state::{RunningState, ScriptState};
 use chrono::Local;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -138,24 +138,27 @@ impl DaemonCore {
         self.shutdown().await
     }
 
-    fn config_dir(&self) -> PathBuf {
-        self.config
-            .config_dir()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    fn script_config_path(&self, name: &str) -> Option<PathBuf> {
+        self.state
+            .scripts
+            .iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.config_path.clone())
     }
 
-    fn sync_settings(&mut self) {
-        if let Some(log_dir) = self.config.log_dir() {
+    fn sync_settings(&mut self, config_path: &Path) {
+        if let Some(log_dir) = self.config.log_dir(config_path) {
+            let config_dir = self.config.config_dir(config_path);
             let resolved = if log_dir.is_absolute() {
                 log_dir.to_path_buf()
             } else {
-                self.config_dir().join(log_dir)
+                config_dir.join(log_dir)
             };
             self.supervisor.set_log_dir(resolved);
         }
 
         if self.loki_tx.is_none() {
-            if let Some(loki_config) = self.config.loki_config().cloned() {
+            if let Some(loki_config) = self.config.loki_config(config_path).cloned() {
                 let (tx, rx) = mpsc::channel(loki_shipper::CHANNEL_CAPACITY);
                 LokiShipper::spawn(rx, loki_config);
                 self.supervisor.set_loki_tx(tx.clone());
@@ -164,10 +167,16 @@ impl DaemonCore {
         }
     }
 
-    fn full_status_list(&self) -> Vec<ProcessInfo> {
+    fn full_status_list(&self, filter_config: Option<&Path>) -> Vec<ProcessInfo> {
         let mut result: HashMap<String, ProcessInfo> = HashMap::new();
 
         for script in &self.state.scripts {
+            if let Some(filter) = filter_config {
+                if script.config_path.as_deref() != Some(filter) {
+                    continue;
+                }
+            }
+
             let uptime = match script.status {
                 ProcessStatus::Running | ProcessStatus::Restarting => script
                     .last_started
@@ -190,12 +199,26 @@ impl DaemonCore {
                     uptime,
                     restart_count: script.restart_count,
                     exit_code: script.exit_code,
+                    config_path: script.config_path.clone(),
                 },
             );
         }
 
         for info in self.supervisor.status_list() {
-            result.insert(info.name.clone(), info);
+            if let Some(filter) = filter_config {
+                let script_config = self.script_config_path(&info.name);
+                if script_config.as_deref() != Some(filter) {
+                    continue;
+                }
+            }
+            let config_path = self.script_config_path(&info.name);
+            result.insert(
+                info.name.clone(),
+                ProcessInfo {
+                    config_path,
+                    ..info
+                },
+            );
         }
 
         let mut list: Vec<ProcessInfo> = result.into_values().collect();
@@ -209,18 +232,47 @@ impl DaemonCore {
                 if let Err(e) = self.config.load(&config_path) {
                     return Response::Error(e.to_string());
                 }
-                self.sync_settings();
-                self.state.config_path = Some(config_path);
-                match self.start_scripts(name).await {
+                self.sync_settings(&config_path);
+
+                if let Some(ref script_name) = name {
+                    if let Some(existing) = self.config.has_script_globally(script_name) {
+                        if existing != config_path {
+                            return Response::Error(format!(
+                                "script '{}' already registered from '{}'",
+                                script_name,
+                                existing.display()
+                            ));
+                        }
+                    }
+                } else {
+                    let new_names: Vec<String> = self.config.script_names(&config_path);
+                    for script_name in &new_names {
+                        if let Some(existing) = self.config.has_script_globally(script_name) {
+                            if existing != config_path {
+                                return Response::Error(format!(
+                                    "script '{}' already registered from '{}'",
+                                    script_name,
+                                    existing.display()
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                match self.start_scripts(name, &config_path).await {
                     Ok(_) => Response::Success,
                     Err(e) => Response::Error(e.to_string()),
                 }
             }
-            Command::Down { name } => match self.stop_scripts(name).await {
-                Ok(_) => Response::Success,
-                Err(e) => Response::Error(e.to_string()),
-            },
-            Command::Ps => Response::ProcessList(self.full_status_list()),
+            Command::Down { name, config_path } => {
+                match self.stop_scripts(name, Some(&config_path)).await {
+                    Ok(_) => Response::Success,
+                    Err(e) => Response::Error(e.to_string()),
+                }
+            }
+            Command::Ps { config_path } => {
+                Response::ProcessList(self.full_status_list(config_path.as_deref()))
+            }
             Command::Logs {
                 name,
                 tail,
@@ -229,7 +281,7 @@ impl DaemonCore {
                 Ok(logs) => Response::Logs(logs),
                 Err(e) => Response::Error(e.to_string()),
             },
-            Command::Reload => match self.reload_config().await {
+            Command::Reload { config_path } => match self.reload_config(&config_path).await {
                 Ok(_) => Response::Success,
                 Err(e) => Response::Error(e.to_string()),
             },
@@ -250,7 +302,14 @@ impl DaemonCore {
         let code = exit_status.code().unwrap_or(-1);
         tracing::warn!(script = %name, exit_code = code, "Process exited with error");
 
-        match (self.config.script(name), self.supervisor.get(name)) {
+        let Some(config_path) = self.script_config_path(name) else {
+            return false;
+        };
+
+        match (
+            self.config.script(&config_path, name),
+            self.supervisor.get(name),
+        ) {
             (Some(def), Some(proc)) => {
                 matches!(def.restart_policy, RestartPolicy::Always)
                     && proc.restart_count < def.effective_max_restarts()
@@ -339,7 +398,12 @@ impl DaemonCore {
     }
 
     async fn handle_restart_after_backoff(&mut self, name: &str, restart_count: u32) {
-        if !self.config.has_script(name) {
+        let Some(config_path) = self.script_config_path(name) else {
+            tracing::info!(script = %name, "Skipping backoff restart - no config path");
+            return;
+        };
+
+        if !self.config.has_script(&config_path, name) {
             tracing::info!(script = %name, "Skipping backoff restart - script removed from config");
             return;
         }
@@ -359,15 +423,18 @@ impl DaemonCore {
             return;
         }
 
-        let script_def = match self.config.script(name).cloned() {
+        let script_def = match self.config.script(&config_path, name).cloned() {
             Some(def) => def,
             None => return,
         };
 
         tracing::info!(script = %name, restart_count, "Executing restart after backoff");
-        let config_dir = self.config_dir();
+        let config_dir = self.config.config_dir(&config_path);
         let broadcast_tx = self.register_log_channel(name);
-        match self.supervisor.start_script(name, &script_def, broadcast_tx, &config_dir) {
+        match self
+            .supervisor
+            .start_script(name, &script_def, broadcast_tx, &config_dir)
+        {
             Ok(ScriptStartResult::Started) => {
                 if let Some(proc) = self.supervisor.get_mut(name) {
                     proc.restart_count = restart_count;
@@ -390,18 +457,25 @@ impl DaemonCore {
     }
 
     async fn handle_cron_tick(&mut self, name: &str) {
-        if !self.config.has_script(name) {
+        let Some(config_path) = self.script_config_path(name) else {
+            return;
+        };
+
+        if !self.config.has_script(&config_path, name) {
             return;
         }
 
-        let script_def = match self.config.script(name).cloned() {
+        let script_def = match self.config.script(&config_path, name).cloned() {
             Some(def) => def,
             None => return,
         };
 
-        let config_dir = self.config_dir();
+        let config_dir = self.config.config_dir(&config_path);
         let broadcast_tx = self.register_log_channel(name);
-        match self.supervisor.start_script(name, &script_def, broadcast_tx, &config_dir) {
+        match self
+            .supervisor
+            .start_script(name, &script_def, broadcast_tx, &config_dir)
+        {
             Ok(ScriptStartResult::Started) => {
                 tracing::info!(script = %name, "Cron-triggered script started");
                 self.update_health_on_start(name).await;
@@ -421,10 +495,14 @@ impl DaemonCore {
         }
     }
 
-    async fn start_scripts(&mut self, name: Option<String>) -> Result<()> {
+    async fn start_scripts(
+        &mut self,
+        name: Option<String>,
+        config_path: &Path,
+    ) -> Result<()> {
         let names: Vec<String> = match name {
             Some(name) => vec![name],
-            None => self.config.config()?.scripts.keys().cloned().collect(),
+            None => self.config.config(config_path)?.scripts.keys().cloned().collect(),
         };
 
         {
@@ -437,26 +515,45 @@ impl DaemonCore {
         }
 
         for name in names {
-            self.start_script(&name).await?;
+            self.start_script(&name, config_path).await?;
         }
         Ok(())
     }
 
-    async fn stop_scripts(&mut self, name: Option<String>) -> Result<()> {
+    async fn stop_scripts(
+        &mut self,
+        name: Option<String>,
+        config_path: Option<&Path>,
+    ) -> Result<()> {
         let names: Vec<String> = match name {
             Some(name) => vec![name],
             None => {
                 let mut seen: HashSet<String> = HashSet::new();
                 let mut all: Vec<String> = Vec::new();
-                for name in self.supervisor.names() {
-                    seen.insert(name.clone());
-                    all.push(name);
-                }
+
                 for s in &self.state.scripts {
+                    if let Some(filter) = config_path {
+                        if s.config_path.as_deref() != Some(filter) {
+                            continue;
+                        }
+                    }
                     if seen.insert(s.name.clone()) {
                         all.push(s.name.clone());
                     }
                 }
+
+                for name in self.supervisor.names() {
+                    if let Some(filter) = config_path {
+                        let script_config = self.script_config_path(&name);
+                        if script_config.as_deref() != Some(filter) {
+                            continue;
+                        }
+                    }
+                    if seen.insert(name.clone()) {
+                        all.push(name);
+                    }
+                }
+
                 all
             }
         };
@@ -466,10 +563,10 @@ impl DaemonCore {
         Ok(())
     }
 
-    async fn start_script(&mut self, name: &str) -> Result<ScriptStartResult> {
+    async fn start_script(&mut self, name: &str, config_path: &Path) -> Result<ScriptStartResult> {
         let script_def = self
             .config
-            .config()?
+            .config(config_path)?
             .scripts
             .get(name)
             .ok_or_else(|| Error::ScriptNotFound {
@@ -478,14 +575,22 @@ impl DaemonCore {
             .clone();
 
         let cron = script_def.cron.clone();
-        let config_dir = self.config_dir();
+        let config_dir = self.config.config_dir(config_path);
         let broadcast_tx = self.register_log_channel(name);
-        let result = self.supervisor.start_script(name, &script_def, broadcast_tx, &config_dir)?;
+        let result = self
+            .supervisor
+            .start_script(name, &script_def, broadcast_tx, &config_dir)?;
 
         if matches!(result, ScriptStartResult::Started) {
             self.update_health_on_start(name).await;
-            self.update_script_state(name, ProcessStatus::Running, false, None)
-                .await?;
+            self.update_script_state_with_config(
+                name,
+                config_path,
+                ProcessStatus::Running,
+                false,
+                None,
+            )
+            .await?;
 
             if let Some(ref cron_expr) = cron {
                 if !self.cron.is_scheduled(name) {
@@ -512,7 +617,10 @@ impl DaemonCore {
             .await?;
 
         self.supervisor.stop_script(name).await?;
-        self.log_channels.lock().expect("log_channels mutex poisoned").remove(name);
+        self.log_channels
+            .lock()
+            .expect("log_channels mutex poisoned")
+            .remove(name);
         self.cron.cancel(name);
         tracing::info!(script = %name, "Script stopped successfully");
         Ok(())
@@ -521,7 +629,10 @@ impl DaemonCore {
     async fn shutdown(&mut self) -> Result<()> {
         self.supervisor.shutdown_all().await;
         self.cron.cancel_all();
-        self.log_channels.lock().expect("log_channels mutex poisoned").clear();
+        self.log_channels
+            .lock()
+            .expect("log_channels mutex poisoned")
+            .clear();
         Ok(())
     }
 
@@ -567,17 +678,15 @@ impl DaemonCore {
             let mut snapshot = self.health.write().await;
             for script in &self.state.scripts {
                 let state = match script.status {
-                    ProcessStatus::Running | ProcessStatus::Restarting => ScriptHealthState::Running,
+                    ProcessStatus::Running | ProcessStatus::Restarting => {
+                        ScriptHealthState::Running
+                    }
                     ProcessStatus::Failed => ScriptHealthState::Failed,
                     ProcessStatus::Stopped => {
-                        if script.exit_code.is_some() {
-                            if script.exit_code == Some(0) {
-                                ScriptHealthState::Succeeded
-                            } else {
-                                ScriptHealthState::Failed
-                            }
-                        } else {
+                        if script.exit_code == Some(0) || script.exit_code.is_none() {
                             ScriptHealthState::Succeeded
+                        } else {
+                            ScriptHealthState::Failed
                         }
                     }
                 };
@@ -598,49 +707,74 @@ impl DaemonCore {
             }
         }
 
-        if let Some(config_path) = self.state.config_path.clone() {
-            if config_path.exists() {
-                tracing::info!(config = ?config_path, "Loading config from state");
-                if let Err(e) = self.config.load(&config_path) {
-                    tracing::warn!(error = ?e, "Failed to load config from state, skipping restore");
-                    return Ok(());
+        let mut config_paths: Vec<PathBuf> = Vec::new();
+        for script in &self.state.scripts {
+            if let Some(ref cp) = script.config_path {
+                if !config_paths.contains(cp) {
+                    config_paths.push(cp.clone());
                 }
-                self.sync_settings();
-            } else {
-                tracing::warn!(config = ?config_path, "Stored config path no longer exists, skipping restore");
-                return Ok(());
             }
-        } else {
-            tracing::info!("No config path in state, skipping restore");
-            return Ok(());
+        }
+
+        for config_path in &config_paths {
+            if !config_path.exists() {
+                tracing::warn!(config = ?config_path, "Stored config path no longer exists, skipping");
+                continue;
+            }
+            tracing::info!(config = ?config_path, "Loading config from state");
+            if let Err(e) = self.config.load(config_path) {
+                tracing::warn!(config = ?config_path, error = ?e, "Failed to load config, skipping");
+                continue;
+            }
+            self.sync_settings(config_path);
         }
 
         let scripts: Vec<ScriptState> = self.state.scripts.clone();
-        for script in scripts {
-            if !matches!(script.status, ProcessStatus::Running | ProcessStatus::Restarting) || script.explicitly_stopped {
+        for script in &scripts {
+            if script.explicitly_stopped {
                 continue;
             }
-            if !self.config.has_script(&script.name) {
+            if !matches!(
+                script.status,
+                ProcessStatus::Running | ProcessStatus::Restarting
+            ) {
+                continue;
+            }
+            let Some(ref config_path) = script.config_path else {
+                tracing::info!(script = %script.name, "Skipping restoration - no config path");
+                continue;
+            };
+            if !self.config.has_script(config_path, &script.name) {
                 tracing::info!(script = %script.name, "Skipping restoration - no longer in config");
                 continue;
             }
             tracing::info!(script = %script.name, "Restoring script");
-            self.start_script(&script.name).await?;
+            if let Err(e) = self.start_script(&script.name, config_path).await {
+                tracing::error!(script = %script.name, error = ?e, "Failed to restore script");
+            }
         }
 
-        let cron_entries: Vec<(String, String)> = self
-            .config
-            .script_names()
-            .into_iter()
-            .filter(|name| !self.cron.is_scheduled(name))
-            .filter_map(|name| {
-                self.config
-                    .script(&name)
-                    .and_then(|def| def.cron.as_ref().map(|expr| (name, expr.clone())))
-            })
-            .collect();
-        for (name, cron_expr) in cron_entries {
-            self.cron.schedule(&name, &cron_expr);
+        for config_path in &config_paths {
+            let cron_entries: Vec<(String, String)> = self
+                .config
+                .script_names(config_path)
+                .into_iter()
+                .filter(|name| !self.cron.is_scheduled(name))
+                .filter(|name| {
+                    !scripts
+                        .iter()
+                        .any(|s| s.name == *name && s.explicitly_stopped)
+                })
+                .filter_map(|name| {
+                    self.config
+                        .script(config_path, &name)
+                        .and_then(|def| def.cron.as_ref().map(|expr| (name, expr.clone())))
+                })
+                .collect();
+
+            for (name, cron_expr) in cron_entries {
+                self.cron.schedule(&name, &cron_expr);
+            }
         }
 
         tracing::info!("State restoration completed");
@@ -673,6 +807,37 @@ impl DaemonCore {
         explicitly_stopped: bool,
         exit_code: Option<i32>,
     ) -> Result<()> {
+        let config_path = self.script_config_path(name);
+        self.update_script_state_inner(name, config_path, status, explicitly_stopped, exit_code)
+            .await
+    }
+
+    async fn update_script_state_with_config(
+        &mut self,
+        name: &str,
+        config_path: &Path,
+        status: ProcessStatus,
+        explicitly_stopped: bool,
+        exit_code: Option<i32>,
+    ) -> Result<()> {
+        self.update_script_state_inner(
+            name,
+            Some(config_path.to_path_buf()),
+            status,
+            explicitly_stopped,
+            exit_code,
+        )
+        .await
+    }
+
+    async fn update_script_state_inner(
+        &mut self,
+        name: &str,
+        config_path: Option<PathBuf>,
+        status: ProcessStatus,
+        explicitly_stopped: bool,
+        exit_code: Option<i32>,
+    ) -> Result<()> {
         let restart_count = self
             .supervisor
             .get(name)
@@ -682,6 +847,7 @@ impl DaemonCore {
 
         let script_state = ScriptState {
             name: name.to_string(),
+            config_path,
             status,
             last_started: start_time,
             last_stopped: if matches!(status, ProcessStatus::Stopped | ProcessStatus::Failed) {
@@ -699,9 +865,9 @@ impl DaemonCore {
         Ok(())
     }
 
-    async fn reload_config(&mut self) -> Result<()> {
-        let diff = self.config.reload()?;
-        self.sync_settings();
+    async fn reload_config(&mut self, config_path: &Path) -> Result<()> {
+        let diff = self.config.reload(config_path)?;
+        self.sync_settings(config_path);
 
         for name in diff.removed {
             tracing::info!(script = %name, "Script removed from config, stopping");
@@ -713,7 +879,7 @@ impl DaemonCore {
 
         for name in diff.added {
             tracing::info!(script = %name, "New script in config, starting");
-            if let Err(e) = self.start_script(&name).await {
+            if let Err(e) = self.start_script(&name, config_path).await {
                 tracing::error!(script = %name, error = ?e, "Failed to start during reload");
             }
         }
@@ -724,7 +890,7 @@ impl DaemonCore {
                 tracing::error!(script = %name, error = ?e, "Failed to stop during reload");
             }
             self.cron.cancel(&name);
-            if let Err(e) = self.start_script(&name).await {
+            if let Err(e) = self.start_script(&name, config_path).await {
                 tracing::error!(script = %name, error = ?e, "Failed to start during reload");
             }
         }
