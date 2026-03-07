@@ -13,7 +13,7 @@ pub enum Error {
     },
 
     #[error("failed to parse config: {0}")]
-    ConfigParse(#[from] serde_yml::Error),
+    ConfigParse(#[from] serde_yaml_ng::Error),
 
     #[error("message size {size} exceeds maximum {max}")]
     MessageTooLarge { size: u32, max: u32 },

@@ -163,7 +163,7 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        let config = serde_yml::from_str(&content)?;
+        let config = serde_yaml_ng::from_str(&content)?;
         Ok(config)
     }
 }

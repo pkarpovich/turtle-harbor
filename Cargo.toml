@@ -1,6 +1,6 @@
 [package]
 name = "turtle-harbor"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 
 [[bin]]
@@ -19,7 +19,7 @@ clap = { version = "4.5.59", features = ["derive"] }
 colored = "3.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-serde_yml = "0.0.12"
+serde_yaml_ng = "0.10"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1.44"
