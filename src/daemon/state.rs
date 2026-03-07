@@ -8,6 +8,8 @@ use tokio::fs;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ScriptState {
     pub name: String,
+    #[serde(default)]
+    pub config_path: Option<PathBuf>,
     pub status: ProcessStatus,
     pub last_started: Option<DateTime<Local>>,
     pub last_stopped: Option<DateTime<Local>>,
@@ -29,7 +31,7 @@ pub struct RunningState {
 impl RunningState {
     pub fn new(state_file: PathBuf) -> Self {
         Self {
-            version: 2,
+            version: 3,
             scripts: Vec::new(),
             state_file,
             config_path: None,
@@ -39,13 +41,17 @@ impl RunningState {
     pub fn load(state_file: &PathBuf) -> Result<Self> {
         if state_file.exists() {
             let content = std::fs::read_to_string(&state_file)?;
-            let serializable: RunningState = serde_json::from_str(&content)?;
-            Ok(Self {
-                version: serializable.version,
-                scripts: serializable.scripts.into_iter().map(Into::into).collect(),
-                state_file: state_file.clone(),
-                config_path: serializable.config_path,
-            })
+            let mut state: RunningState = serde_json::from_str(&content)?;
+            state.state_file = state_file.clone();
+
+            let legacy_config_path = state.config_path.take();
+            for script in &mut state.scripts {
+                if script.config_path.is_none() {
+                    script.config_path = legacy_config_path.clone();
+                }
+            }
+
+            Ok(state)
         } else {
             Ok(RunningState::new(state_file.clone()))
         }
@@ -76,5 +82,150 @@ impl RunningState {
         self.scripts.retain(|s| s.name != name);
         self.save().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn load_old_format_migrates_config_path() {
+        let state_json = r#"{
+            "version": 2,
+            "state_file": "/tmp/state.json",
+            "config_path": "/projects/a/scripts.yml",
+            "scripts": [
+                {
+                    "name": "script1",
+                    "status": "Running",
+                    "last_started": null,
+                    "last_stopped": null,
+                    "exit_code": null,
+                    "explicitly_stopped": false,
+                    "restart_count": 0
+                },
+                {
+                    "name": "script2",
+                    "status": "Stopped",
+                    "last_started": null,
+                    "last_stopped": null,
+                    "exit_code": null,
+                    "explicitly_stopped": true,
+                    "restart_count": 0
+                }
+            ]
+        }"#;
+
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), state_json).unwrap();
+        let state = RunningState::load(&tmp.path().to_path_buf()).unwrap();
+
+        assert_eq!(state.scripts.len(), 2);
+        assert_eq!(
+            state.scripts[0].config_path.as_deref(),
+            Some(std::path::Path::new("/projects/a/scripts.yml"))
+        );
+        assert_eq!(
+            state.scripts[1].config_path.as_deref(),
+            Some(std::path::Path::new("/projects/a/scripts.yml"))
+        );
+        assert!(state.config_path.is_none());
+    }
+
+    #[test]
+    fn load_new_format_preserves_per_script_config_path() {
+        let state_json = r#"{
+            "version": 3,
+            "state_file": "/tmp/state.json",
+            "scripts": [
+                {
+                    "name": "script1",
+                    "config_path": "/projects/a/scripts.yml",
+                    "status": "Running",
+                    "last_started": null,
+                    "last_stopped": null,
+                    "exit_code": null,
+                    "explicitly_stopped": false,
+                    "restart_count": 0
+                },
+                {
+                    "name": "script2",
+                    "config_path": "/projects/b/scripts.yml",
+                    "status": "Stopped",
+                    "last_started": null,
+                    "last_stopped": null,
+                    "exit_code": null,
+                    "explicitly_stopped": true,
+                    "restart_count": 0
+                }
+            ]
+        }"#;
+
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), state_json).unwrap();
+        let state = RunningState::load(&tmp.path().to_path_buf()).unwrap();
+
+        assert_eq!(state.scripts.len(), 2);
+        assert_eq!(
+            state.scripts[0].config_path.as_deref(),
+            Some(std::path::Path::new("/projects/a/scripts.yml"))
+        );
+        assert_eq!(
+            state.scripts[1].config_path.as_deref(),
+            Some(std::path::Path::new("/projects/b/scripts.yml"))
+        );
+    }
+
+    #[test]
+    fn load_mixed_format_migrates_only_missing() {
+        let state_json = r#"{
+            "version": 2,
+            "state_file": "/tmp/state.json",
+            "config_path": "/projects/legacy/scripts.yml",
+            "scripts": [
+                {
+                    "name": "has_path",
+                    "config_path": "/projects/explicit/scripts.yml",
+                    "status": "Running",
+                    "last_started": null,
+                    "last_stopped": null,
+                    "exit_code": null,
+                    "explicitly_stopped": false,
+                    "restart_count": 0
+                },
+                {
+                    "name": "no_path",
+                    "status": "Stopped",
+                    "last_started": null,
+                    "last_stopped": null,
+                    "exit_code": null,
+                    "explicitly_stopped": false,
+                    "restart_count": 0
+                }
+            ]
+        }"#;
+
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), state_json).unwrap();
+        let state = RunningState::load(&tmp.path().to_path_buf()).unwrap();
+
+        assert_eq!(
+            state.scripts[0].config_path.as_deref(),
+            Some(std::path::Path::new("/projects/explicit/scripts.yml"))
+        );
+        assert_eq!(
+            state.scripts[1].config_path.as_deref(),
+            Some(std::path::Path::new("/projects/legacy/scripts.yml"))
+        );
+    }
+
+    #[test]
+    fn load_nonexistent_file_creates_empty_state() {
+        let state = RunningState::load(&PathBuf::from("/nonexistent/state.json")).unwrap();
+        assert_eq!(state.version, 3);
+        assert!(state.scripts.is_empty());
+        assert!(state.config_path.is_none());
     }
 }

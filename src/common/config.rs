@@ -7,7 +7,7 @@ use std::ffi::OsString;
 const DEFAULT_MAX_RESTARTS: u32 = 5;
 const DEFAULT_MAX_RESTARTS_CRON: u32 = 3;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub settings: Settings,
     pub scripts: HashMap<String, Script>,
@@ -20,7 +20,7 @@ pub struct LokiConfig {
     pub labels: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
     pub log_dir: PathBuf,
     #[serde(default)]

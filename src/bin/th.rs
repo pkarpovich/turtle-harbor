@@ -22,6 +22,7 @@ pub enum Commands {
     Up { script_name: Option<String> },
     Down { script_name: Option<String> },
     Ps,
+    List,
     Logs {
         script_name: Option<String>,
         #[arg(short = 'n', long, default_value = "100")]
@@ -58,6 +59,25 @@ pub fn format_status(status: ProcessStatus, exit_code: Option<i32>) -> ColoredSt
     }
 }
 
+fn short_config_label(config_path: Option<&PathBuf>) -> String {
+    let Some(path) = config_path else {
+        return "-".to_string();
+    };
+    let parent = path.parent().unwrap_or(path);
+    let components: Vec<&str> = parent
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    let len = components.len();
+    if len >= 2 {
+        format!("{}/{}", components[len - 2], components[len - 1])
+    } else if len == 1 {
+        components[0].to_string()
+    } else {
+        path.display().to_string()
+    }
+}
+
 fn print_process_list_table(processes: &[ProcessInfo]) {
     if processes.is_empty() {
         println!("No scripts registered. Run 'th up' to start scripts.");
@@ -90,6 +110,40 @@ fn print_process_list_table(processes: &[ProcessInfo]) {
     }
 }
 
+fn print_process_list_table_with_config(processes: &[ProcessInfo]) {
+    if processes.is_empty() {
+        println!("No scripts registered. Run 'th up' to start scripts.");
+        return;
+    }
+
+    println!(
+        "{:<20} {:<8} {:<16} {:<10} {:<8} {:<24}",
+        "NAME".bold(),
+        "PID".bold(),
+        "STATUS".bold(),
+        "UPTIME".bold(),
+        "RESTARTS".bold(),
+        "CONFIG".bold()
+    );
+    println!("{}", "-".repeat(90));
+    for process in processes {
+        let pid = if process.pid > 0 {
+            process.pid.to_string()
+        } else {
+            "-".to_string()
+        };
+        println!(
+            "{:<20} {:<8} {:<16} {:<10} {:<8} {:<24}",
+            process.name,
+            pid,
+            format_status(process.status, process.exit_code),
+            format_duration(process.uptime),
+            process.restart_count,
+            short_config_label(process.config_path.as_ref())
+        );
+    }
+}
+
 #[tokio::main]
 pub async fn main() {
     let cli = Cli::parse();
@@ -118,7 +172,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Down { script_name } => {
-            let response = commands::send_command(Command::Down { name: script_name }).await?;
+            let response = commands::send_command(Command::Down { name: script_name, config_path }).await?;
             match response {
                 Response::Success => println!("Scripts stopped successfully"),
                 Response::Error(e) => eprintln!("Error: {}", e),
@@ -126,11 +180,19 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Ps => {
-            let response = commands::send_command(Command::Ps).await?;
+            let response = commands::send_command(Command::Ps { config_path: Some(config_path) }).await?;
             match response {
                 Response::ProcessList(processes) => print_process_list_table(&processes),
                 Response::Error(e) => eprintln!("Error retrieving process list: {}", e),
                 _ => eprintln!("Unexpected response for ps command"),
+            }
+        }
+        Commands::List => {
+            let response = commands::send_command(Command::Ps { config_path: None }).await?;
+            match response {
+                Response::ProcessList(processes) => print_process_list_table_with_config(&processes),
+                Response::Error(e) => eprintln!("Error retrieving process list: {}", e),
+                _ => eprintln!("Unexpected response for list command"),
             }
         }
         Commands::Logs {
@@ -174,7 +236,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Reload => {
-            let response = commands::send_command(Command::Reload).await?;
+            let response = commands::send_command(Command::Reload { config_path }).await?;
             match response {
                 Response::Success => println!("Configuration reloaded"),
                 Response::Error(e) => eprintln!("Reload error: {}", e),
