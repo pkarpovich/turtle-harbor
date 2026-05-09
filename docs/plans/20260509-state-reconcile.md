@@ -90,9 +90,9 @@ Dependencies identified: none new. Uses existing `ConfigManager`, `State`, healt
 
 ### Task 5: [Final] Update documentation
 
-- [ ] add a short note to `README.md` under a "State management" subsection (or extend "File Locations") explaining that scripts removed from config are pruned from state on next daemon start or on `Command::Reload`
-- [ ] no CHANGELOG file in repo — skip
-- [ ] bump `Cargo.toml` `version` to `0.6.2` (patch — bug fix, no API change)
+- [x] add a short note to `README.md` under a "State management" subsection (or extend "File Locations") explaining that scripts removed from config are pruned from state on next daemon start or on `Command::Reload`
+- [x] no CHANGELOG file in repo — skip
+- [x] bump `Cargo.toml` `version` to `0.6.2` (patch — bug fix, no API change)
 
 *Note: ralphex automatically moves completed plans to `docs/plans/completed/`.*
 

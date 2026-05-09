@@ -143,6 +143,15 @@ When both are specified, inline `env` values override `env_file` values for the 
 | State | `/tmp/turtle-harbor-state.json` |
 | Logs | `./logs/` |
 
+## State management
+
+The daemon persists script state to `state.json` so it can resume scripts across restarts. State is reconciled against loaded configs:
+
+- On daemon startup, any script in `state.json` that is not present in any loaded `scripts.yml` is pruned from both state and the in-memory health snapshot.
+- On `Command::Reload`, scripts removed from config are pruned from state and health, unless they still exist in another loaded config (in which case they are only stopped).
+
+This keeps `/health` a projection of currently-loaded configs — scripts deleted from config no longer linger as `failed`.
+
 ## Contributing
 
 1. Fork the repository
