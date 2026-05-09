@@ -683,6 +683,7 @@ impl DaemonCore {
             }
         }
 
+        let mut parse_failed_paths: HashSet<PathBuf> = HashSet::new();
         for config_path in &config_paths {
             if !config_path.exists() {
                 tracing::warn!(config = ?config_path, "Stored config path no longer exists, skipping");
@@ -690,16 +691,26 @@ impl DaemonCore {
             }
             tracing::info!(config = ?config_path, "Loading config from state");
             if let Err(e) = self.config.load(config_path) {
-                tracing::warn!(config = ?config_path, error = ?e, "Failed to load config, skipping");
+                tracing::warn!(config = ?config_path, error = ?e, "Failed to load config, preserving state for its scripts");
+                parse_failed_paths.insert(config_path.clone());
                 continue;
             }
             self.sync_settings(config_path);
         }
 
+        let preserve_parse_failure = |script: &ScriptState| -> bool {
+            script
+                .config_path
+                .as_ref()
+                .is_some_and(|cp| parse_failed_paths.contains(cp))
+        };
+
         {
             let mut snapshot = self.health.write().await;
             for script in &self.state.scripts {
-                if self.config.has_script_globally(&script.name).is_none() {
+                if !preserve_parse_failure(script)
+                    && self.config.has_script_globally(&script.name).is_none()
+                {
                     continue;
                 }
                 let state = match script.status {
@@ -736,7 +747,7 @@ impl DaemonCore {
             .state
             .scripts
             .iter()
-            .filter(|s| self.is_orphan(&s.name))
+            .filter(|s| !preserve_parse_failure(s) && self.is_orphan(&s.name))
             .map(|s| s.name.clone())
             .collect();
         for name in orphan_names {
@@ -885,8 +896,14 @@ impl DaemonCore {
     }
 
     async fn forget_script(&mut self, name: &str) {
-        if let Err(e) = self.stop_script(name).await {
-            tracing::debug!(script = %name, error = ?e, "stop_script during forget_script (ignored)");
+        if self.supervisor.contains(name) {
+            if let Err(e) = self.supervisor.stop_script(name).await {
+                tracing::debug!(script = %name, error = ?e, "supervisor.stop during forget_script (ignored)");
+            }
+            self.log_channels
+                .lock()
+                .expect("log_channels mutex poisoned")
+                .remove(name);
         }
         self.cron.cancel(name);
         if let Err(e) = self.state.remove_script(name).await {
@@ -1207,6 +1224,26 @@ scripts:
         core.reload_config(&cfg_a_path).await.unwrap();
 
         assert!(core.state.scripts.iter().any(|s| s.name == "foo"));
+        assert!(core.health.read().await.contains_key("foo"));
+    }
+
+    #[tokio::test]
+    async fn restore_state_preserves_entries_when_config_parse_fails() {
+        let (mut core, tmp) = make_core();
+        let cfg_path = tmp.path().join("broken.yml");
+        std::fs::write(&cfg_path, "scripts: [this is not valid yaml: }}}").unwrap();
+
+        core.state
+            .update_script(dummy_script_state("foo", Some(cfg_path.clone())))
+            .await
+            .unwrap();
+
+        core.restore_state().await.unwrap();
+
+        assert!(
+            core.state.scripts.iter().any(|s| s.name == "foo"),
+            "scripts referencing a config that exists but failed to parse must not be pruned"
+        );
         assert!(core.health.read().await.contains_key("foo"));
     }
 
