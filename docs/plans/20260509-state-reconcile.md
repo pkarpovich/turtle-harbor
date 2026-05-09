@@ -56,11 +56,11 @@ Dependencies identified: none new. Uses existing `ConfigManager`, `State`, healt
 
 ### Task 1: Add `forget_script` and `is_orphan` helpers in `DaemonCore`
 
-- [ ] add `fn is_orphan(&self, name: &str) -> bool` in `daemon_core.rs` that returns `self.config.has_script_globally(name).is_none()`
-- [ ] add `async fn forget_script(&mut self, name: &str)` that: (1) calls `self.stop_script(name)` defensively (logs and ignores error), (2) calls `self.cron.cancel(name)`, (3) calls `self.state.remove_script(name)` (logs and ignores error), (4) removes the entry from `self.health` snapshot
-- [ ] write unit tests for `is_orphan`: empty config returns true; script in config returns false; script in another config (multi-config) returns false
-- [ ] write unit test for `forget_script`: pre-populate state + health with a script, call forget_script, assert both are empty afterwards
-- [ ] run `cargo test` and `cargo clippy --all-targets -- -D warnings` — must pass before Task 2
+- [x] add `fn is_orphan(&self, name: &str) -> bool` in `daemon_core.rs` that returns `self.config.has_script_globally(name).is_none()`
+- [x] add `async fn forget_script(&mut self, name: &str)` that: (1) calls `self.stop_script(name)` defensively (logs and ignores error), (2) calls `self.cron.cancel(name)`, (3) calls `self.state.remove_script(name)` (logs and ignores error), (4) removes the entry from `self.health` snapshot
+- [x] write unit tests for `is_orphan`: empty config returns true; script in config returns false; script in another config (multi-config) returns false
+- [x] write unit test for `forget_script`: pre-populate state + health with a script, call forget_script, assert both are empty afterwards
+- [x] run `cargo test` and `cargo clippy --all-targets -- -D warnings` — must pass before Task 2
 
 ### Task 2: Reconcile orphans at end of `restore_state`
 

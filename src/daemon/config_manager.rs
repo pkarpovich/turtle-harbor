@@ -53,7 +53,7 @@ impl ConfigManager {
     pub fn has_script(&self, config_path: &Path, name: &str) -> bool {
         self.configs
             .get(config_path)
-            .map_or(false, |c| c.scripts.contains_key(name))
+            .is_some_and(|c| c.scripts.contains_key(name))
     }
 
     pub fn has_script_globally(&self, name: &str) -> Option<PathBuf> {

@@ -40,7 +40,7 @@ impl RunningState {
 
     pub fn load(state_file: &PathBuf) -> Result<Self> {
         if state_file.exists() {
-            let content = std::fs::read_to_string(&state_file)?;
+            let content = std::fs::read_to_string(state_file)?;
             let mut state: RunningState = serde_json::from_str(&content)?;
             state.state_file = state_file.clone();
 

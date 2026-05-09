@@ -865,6 +865,23 @@ impl DaemonCore {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    fn is_orphan(&self, name: &str) -> bool {
+        self.config.has_script_globally(name).is_none()
+    }
+
+    #[allow(dead_code)]
+    async fn forget_script(&mut self, name: &str) {
+        if let Err(e) = self.stop_script(name).await {
+            tracing::debug!(script = %name, error = ?e, "stop_script during forget_script (ignored)");
+        }
+        self.cron.cancel(name);
+        if let Err(e) = self.state.remove_script(name).await {
+            tracing::error!(script = %name, error = ?e, "Failed to remove from state during forget_script");
+        }
+        self.health.write().await.remove(name);
+    }
+
     async fn reload_config(&mut self, config_path: &Path) -> Result<()> {
         let diff = self.config.reload(config_path)?;
         self.sync_settings(config_path);
@@ -897,5 +914,123 @@ impl DaemonCore {
 
         tracing::info!("Configuration reloaded");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::{NamedTempFile, TempDir};
+
+    fn write_config(content: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    fn make_core() -> (DaemonCore, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let state_file = tmp.path().join("state.json");
+        let log_dir = tmp.path().join("logs");
+        let core = DaemonCore::new(state_file, log_dir).unwrap();
+        (core, tmp)
+    }
+
+    fn dummy_script_state(name: &str, config_path: Option<PathBuf>) -> ScriptState {
+        ScriptState {
+            name: name.to_string(),
+            config_path,
+            status: ProcessStatus::Failed,
+            last_started: None,
+            last_stopped: None,
+            exit_code: Some(1),
+            explicitly_stopped: false,
+            restart_count: 0,
+        }
+    }
+
+    const CONFIG_WITH_FOO: &str = r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  foo:
+    command: "echo foo"
+    restart_policy: "never"
+"#;
+
+    const CONFIG_WITH_BAR: &str = r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  bar:
+    command: "echo bar"
+    restart_policy: "never"
+"#;
+
+    #[tokio::test]
+    async fn is_orphan_with_empty_config_returns_true() {
+        let (core, _tmp) = make_core();
+        assert!(core.is_orphan("anything"));
+    }
+
+    #[tokio::test]
+    async fn is_orphan_returns_false_when_script_in_loaded_config() {
+        let (mut core, _tmp) = make_core();
+        let cfg = write_config(CONFIG_WITH_FOO);
+        core.config.load(cfg.path()).unwrap();
+
+        assert!(!core.is_orphan("foo"));
+        assert!(core.is_orphan("missing"));
+    }
+
+    #[tokio::test]
+    async fn is_orphan_returns_false_when_script_in_other_loaded_config() {
+        let (mut core, _tmp) = make_core();
+        let cfg_a = write_config(CONFIG_WITH_FOO);
+        let cfg_b = write_config(CONFIG_WITH_BAR);
+        core.config.load(cfg_a.path()).unwrap();
+        core.config.load(cfg_b.path()).unwrap();
+
+        assert!(!core.is_orphan("foo"));
+        assert!(!core.is_orphan("bar"));
+        assert!(core.is_orphan("baz"));
+    }
+
+    #[tokio::test]
+    async fn forget_script_clears_state_and_health() {
+        let (mut core, _tmp) = make_core();
+
+        core.state
+            .update_script(dummy_script_state("ghost", None))
+            .await
+            .unwrap();
+        core.health.write().await.insert(
+            "ghost".to_string(),
+            ScriptHealth {
+                name: "ghost".to_string(),
+                healthy: false,
+                state: ScriptHealthState::Failed,
+                last_exit_code: Some(1),
+                last_run_at: None,
+                last_finished_at: None,
+                pid: None,
+                restart_count: 0,
+            },
+        );
+
+        core.forget_script("ghost").await;
+
+        assert!(core.state.scripts.iter().all(|s| s.name != "ghost"));
+        assert!(!core.health.read().await.contains_key("ghost"));
+    }
+
+    #[tokio::test]
+    async fn forget_script_is_idempotent_on_unknown_name() {
+        let (mut core, _tmp) = make_core();
+        core.forget_script("never-existed").await;
+        assert!(core.state.scripts.is_empty());
+        assert!(core.health.read().await.is_empty());
     }
 }
