@@ -74,11 +74,11 @@ Dependencies identified: none new. Uses existing `ConfigManager`, `State`, healt
 
 ### Task 3: Use `forget_script` in `reload_config` for removed scripts
 
-- [ ] in `daemon_core.rs:reload_config` (around line 872), replace the `for name in diff.removed { stop_script + state.remove_script }` block with `for name in diff.removed { if self.is_orphan(&name) { self.forget_script(&name).await; } else { self.stop_script(&name).await; } }`
-- [ ] rationale: a script removed from config A but still present in config B is not an orphan — only stop it; do not wipe state/health
-- [ ] add test `reload_removes_from_health`: load a config containing `foo`, simulate a process exit so `foo` ends up `Failed` in health, rewrite config without `foo`, call `reload_config`, assert `foo` is absent from health snapshot and state
-- [ ] add test `reload_keeps_script_present_in_other_config`: multi-config; remove script from config A while it still exists in config B; assert it is stopped (if running) but state/health entries remain
-- [ ] run `cargo test` and `cargo clippy --all-targets -- -D warnings` — must pass before Task 4
+- [x] in `daemon_core.rs:reload_config` (around line 872), replace the `for name in diff.removed { stop_script + state.remove_script }` block with `for name in diff.removed { if self.is_orphan(&name) { self.forget_script(&name).await; } else { self.stop_script(&name).await; } }`
+- [x] rationale: a script removed from config A but still present in config B is not an orphan — only stop it; do not wipe state/health
+- [x] add test `reload_removes_from_health`: load a config containing `foo`, simulate a process exit so `foo` ends up `Failed` in health, rewrite config without `foo`, call `reload_config`, assert `foo` is absent from health snapshot and state
+- [x] add test `reload_keeps_script_present_in_other_config`: multi-config; remove script from config A while it still exists in config B; assert it is stopped (if running) but state/health entries remain
+- [x] run `cargo test` and `cargo clippy --all-targets -- -D warnings` — must pass before Task 4
 
 ### Task 4: Verify acceptance criteria
 

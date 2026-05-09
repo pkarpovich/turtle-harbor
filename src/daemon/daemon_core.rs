@@ -900,11 +900,15 @@ impl DaemonCore {
         self.sync_settings(config_path);
 
         for name in diff.removed {
-            tracing::info!(script = %name, "Script removed from config, stopping");
-            if let Err(e) = self.stop_script(&name).await {
-                tracing::error!(script = %name, error = ?e, "Failed to stop during reload");
+            if self.is_orphan(&name) {
+                tracing::info!(script = %name, "Script removed from config, pruning state and health");
+                self.forget_script(&name).await;
+            } else {
+                tracing::info!(script = %name, "Script removed from this config but present elsewhere, stopping only");
+                if let Err(e) = self.stop_script(&name).await {
+                    tracing::error!(script = %name, error = ?e, "Failed to stop during reload");
+                }
             }
-            self.state.remove_script(&name).await?;
         }
 
         for name in diff.added {
@@ -1125,6 +1129,85 @@ scripts:
         assert!(health.contains_key("foo"));
         assert!(health.contains_key("keeper"));
         assert!(health.contains_key("bar"));
+    }
+
+    const EMPTY_CONFIG: &str = r#"
+settings:
+  log_dir: "./logs"
+scripts: {}
+"#;
+
+    fn dummy_health(name: &str) -> ScriptHealth {
+        ScriptHealth {
+            name: name.to_string(),
+            healthy: false,
+            state: ScriptHealthState::Failed,
+            last_exit_code: Some(1),
+            last_run_at: None,
+            last_finished_at: None,
+            pid: None,
+            restart_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_removes_from_health() {
+        let (mut core, tmp) = make_core();
+        let cfg_path = tmp.path().join("scripts.yml");
+        std::fs::write(&cfg_path, CONFIG_WITH_FOO).unwrap();
+        core.config.load(&cfg_path).unwrap();
+
+        core.state
+            .update_script(dummy_script_state("foo", Some(cfg_path.clone())))
+            .await
+            .unwrap();
+        core.health
+            .write()
+            .await
+            .insert("foo".to_string(), dummy_health("foo"));
+
+        std::fs::write(&cfg_path, EMPTY_CONFIG).unwrap();
+        core.reload_config(&cfg_path).await.unwrap();
+
+        assert!(core.state.scripts.iter().all(|s| s.name != "foo"));
+        assert!(!core.health.read().await.contains_key("foo"));
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_script_present_in_other_config() {
+        let (mut core, tmp) = make_core();
+        let cfg_a_path = tmp.path().join("a.yml");
+        let cfg_b_path = tmp.path().join("b.yml");
+        std::fs::write(&cfg_a_path, CONFIG_WITH_FOO).unwrap();
+        std::fs::write(
+            &cfg_b_path,
+            r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  foo:
+    command: "echo foo-from-b"
+    restart_policy: "never"
+"#,
+        )
+        .unwrap();
+        core.config.load(&cfg_a_path).unwrap();
+        core.config.load(&cfg_b_path).unwrap();
+
+        core.state
+            .update_script(dummy_script_state("foo", Some(cfg_a_path.clone())))
+            .await
+            .unwrap();
+        core.health
+            .write()
+            .await
+            .insert("foo".to_string(), dummy_health("foo"));
+
+        std::fs::write(&cfg_a_path, EMPTY_CONFIG).unwrap();
+        core.reload_config(&cfg_a_path).await.unwrap();
+
+        assert!(core.state.scripts.iter().any(|s| s.name == "foo"));
+        assert!(core.health.read().await.contains_key("foo"));
     }
 
     #[tokio::test]
