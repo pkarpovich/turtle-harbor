@@ -82,11 +82,11 @@ Dependencies identified: none new. Uses existing `ConfigManager`, `State`, healt
 
 ### Task 4: Verify acceptance criteria
 
-- [ ] verify all requirements from Overview are implemented (orphan in state at startup → pruned; orphan after reload → pruned; multi-config orphan rule respected)
-- [ ] run full `cargo test` — all tests green
-- [ ] run `cargo clippy --all-targets -- -D warnings` — zero warnings
-- [ ] run `cargo build --release` — must compile cleanly
-- [ ] confirm no public API surface change (binaries `th` and `turtled` keep the same flags and IPC commands)
+- [x] verify all requirements from Overview are implemented (orphan in state at startup → pruned; orphan after reload → pruned; multi-config orphan rule respected)
+- [x] run full `cargo test` — all tests green
+- [x] run `cargo clippy --all-targets -- -D warnings` — zero warnings
+- [x] run `cargo build --release` — must compile cleanly
+- [x] confirm no public API surface change (binaries `th` and `turtled` keep the same flags and IPC commands)
 
 ### Task 5: [Final] Update documentation
 
