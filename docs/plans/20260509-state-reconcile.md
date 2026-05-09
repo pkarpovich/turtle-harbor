@@ -64,13 +64,13 @@ Dependencies identified: none new. Uses existing `ConfigManager`, `State`, healt
 
 ### Task 2: Reconcile orphans at end of `restore_state`
 
-- [ ] in `daemon_core.rs:restore_state`, after the config-loading loop (around line 730), collect `orphan_names: Vec<String> = self.state.scripts.iter().filter(|s| self.is_orphan(&s.name)).map(|s| s.name.clone()).collect()`
-- [ ] for each orphan, log `tracing::info!(script = %name, "Pruning orphan from state — not in any loaded config")` and call `self.forget_script(&name).await`
-- [ ] also skip inserting orphans into the health snapshot at lines 678-707 (filter before insert) — so they never appear in `/health` even briefly during startup
-- [ ] add unit/integration test `restore_state_prunes_orphans`: build a daemon with a temp `state.json` containing an entry whose name is not in the loaded `scripts.yml`; after `restore_state` returns, the script must be absent from both `state.scripts` and the health snapshot
-- [ ] add test `restore_state_keeps_scripts_in_other_config`: multi-config, script lives in `config_b` but state entry has `config_path = config_a`; assert it remains
-- [ ] add test `restore_state_drops_entries_for_missing_config_file`: state references a `config_path` that no longer exists on disk and the script is in no other config → script is pruned
-- [ ] run `cargo test` and `cargo clippy --all-targets -- -D warnings` — must pass before Task 3
+- [x] in `daemon_core.rs:restore_state`, after the config-loading loop (around line 730), collect `orphan_names: Vec<String> = self.state.scripts.iter().filter(|s| self.is_orphan(&s.name)).map(|s| s.name.clone()).collect()`
+- [x] for each orphan, log `tracing::info!(script = %name, "Pruning orphan from state — not in any loaded config")` and call `self.forget_script(&name).await`
+- [x] also skip inserting orphans into the health snapshot at lines 678-707 (filter before insert) — so they never appear in `/health` even briefly during startup
+- [x] add unit/integration test `restore_state_prunes_orphans`: build a daemon with a temp `state.json` containing an entry whose name is not in the loaded `scripts.yml`; after `restore_state` returns, the script must be absent from both `state.scripts` and the health snapshot
+- [x] add test `restore_state_keeps_scripts_in_other_config`: multi-config, script lives in `config_b` but state entry has `config_path = config_a`; assert it remains
+- [x] add test `restore_state_drops_entries_for_missing_config_file`: state references a `config_path` that no longer exists on disk and the script is in no other config → script is pruned
+- [x] run `cargo test` and `cargo clippy --all-targets -- -D warnings` — must pass before Task 3
 
 ### Task 3: Use `forget_script` in `reload_config` for removed scripts
 

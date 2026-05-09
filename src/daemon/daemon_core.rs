@@ -674,9 +674,34 @@ impl DaemonCore {
     async fn restore_state(&mut self) -> Result<()> {
         tracing::info!("Starting state restoration");
 
+        let mut config_paths: Vec<PathBuf> = Vec::new();
+        for script in &self.state.scripts {
+            if let Some(ref cp) = script.config_path {
+                if !config_paths.contains(cp) {
+                    config_paths.push(cp.clone());
+                }
+            }
+        }
+
+        for config_path in &config_paths {
+            if !config_path.exists() {
+                tracing::warn!(config = ?config_path, "Stored config path no longer exists, skipping");
+                continue;
+            }
+            tracing::info!(config = ?config_path, "Loading config from state");
+            if let Err(e) = self.config.load(config_path) {
+                tracing::warn!(config = ?config_path, error = ?e, "Failed to load config, skipping");
+                continue;
+            }
+            self.sync_settings(config_path);
+        }
+
         {
             let mut snapshot = self.health.write().await;
             for script in &self.state.scripts {
+                if self.config.has_script_globally(&script.name).is_none() {
+                    continue;
+                }
                 let state = match script.status {
                     ProcessStatus::Running | ProcessStatus::Restarting => {
                         ScriptHealthState::Running
@@ -707,26 +732,16 @@ impl DaemonCore {
             }
         }
 
-        let mut config_paths: Vec<PathBuf> = Vec::new();
-        for script in &self.state.scripts {
-            if let Some(ref cp) = script.config_path {
-                if !config_paths.contains(cp) {
-                    config_paths.push(cp.clone());
-                }
-            }
-        }
-
-        for config_path in &config_paths {
-            if !config_path.exists() {
-                tracing::warn!(config = ?config_path, "Stored config path no longer exists, skipping");
-                continue;
-            }
-            tracing::info!(config = ?config_path, "Loading config from state");
-            if let Err(e) = self.config.load(config_path) {
-                tracing::warn!(config = ?config_path, error = ?e, "Failed to load config, skipping");
-                continue;
-            }
-            self.sync_settings(config_path);
+        let orphan_names: Vec<String> = self
+            .state
+            .scripts
+            .iter()
+            .filter(|s| self.is_orphan(&s.name))
+            .map(|s| s.name.clone())
+            .collect();
+        for name in orphan_names {
+            tracing::info!(script = %name, "Pruning orphan from state - not in any loaded config");
+            self.forget_script(&name).await;
         }
 
         let scripts: Vec<ScriptState> = self.state.scripts.clone();
@@ -865,12 +880,10 @@ impl DaemonCore {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn is_orphan(&self, name: &str) -> bool {
         self.config.has_script_globally(name).is_none()
     }
 
-    #[allow(dead_code)]
     async fn forget_script(&mut self, name: &str) {
         if let Err(e) = self.stop_script(name).await {
             tracing::debug!(script = %name, error = ?e, "stop_script during forget_script (ignored)");
@@ -969,6 +982,18 @@ scripts:
     restart_policy: "never"
 "#;
 
+    const CONFIG_WITH_BAR_AND_KEEPER: &str = r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  bar:
+    command: "echo bar"
+    restart_policy: "never"
+  keeper:
+    command: "echo keeper"
+    restart_policy: "never"
+"#;
+
     #[tokio::test]
     async fn is_orphan_with_empty_config_returns_true() {
         let (core, _tmp) = make_core();
@@ -1032,5 +1057,90 @@ scripts:
         core.forget_script("never-existed").await;
         assert!(core.state.scripts.is_empty());
         assert!(core.health.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_state_prunes_orphans() {
+        let (mut core, _tmp) = make_core();
+        let cfg = write_config(CONFIG_WITH_FOO);
+
+        core.state
+            .update_script(dummy_script_state(
+                "foo",
+                Some(cfg.path().to_path_buf()),
+            ))
+            .await
+            .unwrap();
+        core.state
+            .update_script(dummy_script_state(
+                "ghost",
+                Some(cfg.path().to_path_buf()),
+            ))
+            .await
+            .unwrap();
+
+        core.restore_state().await.unwrap();
+
+        assert!(core.state.scripts.iter().any(|s| s.name == "foo"));
+        assert!(core.state.scripts.iter().all(|s| s.name != "ghost"));
+        let health = core.health.read().await;
+        assert!(health.contains_key("foo"));
+        assert!(!health.contains_key("ghost"));
+    }
+
+    #[tokio::test]
+    async fn restore_state_keeps_scripts_in_other_config() {
+        let (mut core, _tmp) = make_core();
+        let cfg_a = write_config(CONFIG_WITH_FOO);
+        let cfg_b = write_config(CONFIG_WITH_BAR_AND_KEEPER);
+
+        core.state
+            .update_script(dummy_script_state(
+                "foo",
+                Some(cfg_a.path().to_path_buf()),
+            ))
+            .await
+            .unwrap();
+        core.state
+            .update_script(dummy_script_state(
+                "keeper",
+                Some(cfg_b.path().to_path_buf()),
+            ))
+            .await
+            .unwrap();
+        core.state
+            .update_script(dummy_script_state(
+                "bar",
+                Some(cfg_a.path().to_path_buf()),
+            ))
+            .await
+            .unwrap();
+
+        core.restore_state().await.unwrap();
+
+        assert!(core.state.scripts.iter().any(|s| s.name == "foo"));
+        assert!(core.state.scripts.iter().any(|s| s.name == "keeper"));
+        assert!(core.state.scripts.iter().any(|s| s.name == "bar"));
+        let health = core.health.read().await;
+        assert!(health.contains_key("foo"));
+        assert!(health.contains_key("keeper"));
+        assert!(health.contains_key("bar"));
+    }
+
+    #[tokio::test]
+    async fn restore_state_drops_entries_for_missing_config_file() {
+        let (mut core, tmp) = make_core();
+        let missing_config = tmp.path().join("nonexistent-config.yml");
+
+        core.state
+            .update_script(dummy_script_state("ghost", Some(missing_config)))
+            .await
+            .unwrap();
+
+        core.restore_state().await.unwrap();
+
+        assert!(core.state.scripts.is_empty());
+        let health = core.health.read().await;
+        assert!(!health.contains_key("ghost"));
     }
 }
