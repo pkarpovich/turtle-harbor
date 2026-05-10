@@ -19,6 +19,11 @@ pub fn handle_error(error: Error) -> ! {
         }
         Error::CommandTimeout => "Command timed out waiting for daemon response".to_string(),
         Error::ScriptNotFound { name } => format!("Script '{}' not found", name),
+        Error::DuplicateScript { name, path } => format!(
+            "Script '{}' already registered from '{}'",
+            name,
+            path.display()
+        ),
         Error::ConfigNotLoaded => "No configuration loaded - run 'th up' first".to_string(),
         Error::CronParse {
             expression,

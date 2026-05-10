@@ -5,6 +5,7 @@ use tokio::task::JoinHandle;
 
 pub struct ManagedProcess {
     pub pid: u32,
+    pub instance_id: u64,
     pub status: ProcessStatus,
     pub start_time: Option<DateTime<Local>>,
     pub restart_count: u32,

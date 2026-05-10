@@ -24,6 +24,9 @@ pub enum Error {
     #[error("script '{name}' not found")]
     ScriptNotFound { name: String },
 
+    #[error("script '{name}' already registered from '{path}'")]
+    DuplicateScript { name: String, path: PathBuf },
+
     #[error("invalid cron expression '{expression}': {source}")]
     CronParse {
         expression: String,
