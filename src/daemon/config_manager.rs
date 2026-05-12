@@ -53,7 +53,7 @@ impl ConfigManager {
     pub fn has_script(&self, config_path: &Path, name: &str) -> bool {
         self.configs
             .get(config_path)
-            .map_or(false, |c| c.scripts.contains_key(name))
+            .is_some_and(|c| c.scripts.contains_key(name))
     }
 
     pub fn has_script_globally(&self, name: &str) -> Option<PathBuf> {
@@ -88,6 +88,26 @@ impl ConfigManager {
             .clone();
 
         let new_config = Config::load(config_path)?;
+
+        for name in new_config.scripts.keys() {
+            if let Some(existing) = self
+                .configs
+                .iter()
+                .find_map(|(path, config)| {
+                    if path.as_path() != config_path && config.scripts.contains_key(name) {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                })
+            {
+                return Err(Error::DuplicateScript {
+                    name: name.clone(),
+                    path: existing,
+                });
+            }
+        }
+
         self.configs.insert(config_path.to_path_buf(), new_config);
 
         let new_config = self.configs.get(config_path).expect("just inserted");
@@ -259,6 +279,44 @@ scripts:
         assert_eq!(diff.added, vec!["added"]);
         assert_eq!(diff.removed, vec!["removed"]);
         assert_eq!(diff.changed, vec!["changed"]);
+    }
+
+    #[test]
+    fn reload_rejects_duplicate_script_from_other_config() {
+        let file_a = write_config(CONFIG_A);
+        let file_b = write_config(CONFIG_B);
+        let mut mgr = ConfigManager::new();
+
+        mgr.load(file_a.path()).unwrap();
+        mgr.load(file_b.path()).unwrap();
+
+        let collide = r#"
+settings:
+  log_dir: "./logs-b"
+scripts:
+  script_b1:
+    command: "echo b1"
+    restart_policy: "never"
+  script_a1:
+    command: "echo poached"
+    restart_policy: "never"
+"#;
+        std::fs::write(file_b.path(), collide).unwrap();
+
+        let err = mgr
+            .reload(file_b.path())
+            .err()
+            .expect("expected DuplicateScript error");
+        match err {
+            Error::DuplicateScript { name, path } => {
+                assert_eq!(name, "script_a1");
+                assert_eq!(path, file_a.path());
+            }
+            other => panic!("expected DuplicateScript error, got {}", other),
+        }
+
+        assert!(mgr.has_script(file_b.path(), "script_b1"));
+        assert!(!mgr.has_script(file_b.path(), "script_a1"));
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub enum DaemonEvent {
     },
     ProcessExited {
         name: String,
+        instance_id: u64,
         status: Option<ExitStatus>,
     },
     RestartAfterBackoff {
@@ -115,8 +116,12 @@ impl DaemonCore {
                     let response = self.handle_command(command).await;
                     let _ = reply_tx.send(response);
                 }
-                DaemonEvent::ProcessExited { name, status } => {
-                    self.handle_process_exit(&name, status).await;
+                DaemonEvent::ProcessExited {
+                    name,
+                    instance_id,
+                    status,
+                } => {
+                    self.handle_process_exit(&name, instance_id, status).await;
                 }
                 DaemonEvent::RestartAfterBackoff {
                     name,
@@ -318,7 +323,21 @@ impl DaemonCore {
         }
     }
 
-    async fn handle_process_exit(&mut self, name: &str, status: Option<ExitStatus>) {
+    async fn handle_process_exit(
+        &mut self,
+        name: &str,
+        instance_id: u64,
+        status: Option<ExitStatus>,
+    ) {
+        if self.supervisor.get(name).map(|p| p.instance_id) != Some(instance_id) {
+            tracing::debug!(
+                script = %name,
+                instance_id,
+                "Dropping stale exit event - supervisor entry mismatch"
+            );
+            return;
+        }
+
         let exit_code = status.and_then(|s| s.code());
         let succeeded = status.map(|s| s.success()).unwrap_or(false);
 
@@ -616,6 +635,16 @@ impl DaemonCore {
         self.update_script_state(name, ProcessStatus::Stopped, true, None)
             .await?;
 
+        {
+            let mut snapshot = self.health.write().await;
+            if let Some(entry) = snapshot.get_mut(name) {
+                entry.state = ScriptHealthState::Succeeded;
+                entry.healthy = true;
+                entry.last_finished_at = Some(Local::now());
+                entry.pid = None;
+            }
+        }
+
         self.supervisor.stop_script(name).await?;
         self.log_channels
             .lock()
@@ -674,9 +703,65 @@ impl DaemonCore {
     async fn restore_state(&mut self) -> Result<()> {
         tracing::info!("Starting state restoration");
 
+        let mut config_paths: Vec<PathBuf> = Vec::new();
+        for script in &self.state.scripts {
+            if let Some(ref cp) = script.config_path {
+                if !config_paths.contains(cp) {
+                    config_paths.push(cp.clone());
+                }
+            }
+        }
+
+        let mut parse_failed_paths: HashSet<PathBuf> = HashSet::new();
+        for config_path in &config_paths {
+            if !config_path.exists() {
+                tracing::warn!(config = ?config_path, "Stored config path no longer exists, skipping");
+                continue;
+            }
+            tracing::info!(config = ?config_path, "Loading config from state");
+            if let Err(e) = self.config.load(config_path) {
+                tracing::warn!(config = ?config_path, error = ?e, "Failed to load config, preserving state for its scripts");
+                parse_failed_paths.insert(config_path.clone());
+                continue;
+            }
+            self.sync_settings(config_path);
+        }
+
+        let preserve_parse_failure = |script: &ScriptState| -> bool {
+            script
+                .config_path
+                .as_ref()
+                .is_some_and(|cp| parse_failed_paths.contains(cp))
+        };
+
+        let mut rebound = false;
+        for script in self.state.scripts.iter_mut() {
+            let Some(global_path) = self.config.has_script_globally(&script.name) else {
+                continue;
+            };
+            if script.config_path.as_ref() != Some(&global_path) {
+                tracing::info!(
+                    script = %script.name,
+                    old = ?script.config_path,
+                    new = ?global_path,
+                    "Rebinding stored config_path to current location during restore"
+                );
+                script.config_path = Some(global_path);
+                rebound = true;
+            }
+        }
+        if rebound {
+            if let Err(e) = self.state.save().await {
+                tracing::error!(error = ?e, "Failed to persist rebound config_paths during restore");
+            }
+        }
+
         {
             let mut snapshot = self.health.write().await;
             for script in &self.state.scripts {
+                if self.config.has_script_globally(&script.name).is_none() {
+                    continue;
+                }
                 let state = match script.status {
                     ProcessStatus::Running | ProcessStatus::Restarting => {
                         ScriptHealthState::Running
@@ -707,26 +792,16 @@ impl DaemonCore {
             }
         }
 
-        let mut config_paths: Vec<PathBuf> = Vec::new();
-        for script in &self.state.scripts {
-            if let Some(ref cp) = script.config_path {
-                if !config_paths.contains(cp) {
-                    config_paths.push(cp.clone());
-                }
-            }
-        }
-
-        for config_path in &config_paths {
-            if !config_path.exists() {
-                tracing::warn!(config = ?config_path, "Stored config path no longer exists, skipping");
-                continue;
-            }
-            tracing::info!(config = ?config_path, "Loading config from state");
-            if let Err(e) = self.config.load(config_path) {
-                tracing::warn!(config = ?config_path, error = ?e, "Failed to load config, skipping");
-                continue;
-            }
-            self.sync_settings(config_path);
+        let orphan_names: Vec<String> = self
+            .state
+            .scripts
+            .iter()
+            .filter(|s| !preserve_parse_failure(s) && self.is_orphan(&s.name))
+            .map(|s| s.name.clone())
+            .collect();
+        for name in orphan_names {
+            tracing::info!(script = %name, "Pruning orphan from state - not in any loaded config");
+            self.forget_script(&name).await;
         }
 
         let scripts: Vec<ScriptState> = self.state.scripts.clone();
@@ -865,16 +940,121 @@ impl DaemonCore {
         Ok(())
     }
 
+    fn is_orphan(&self, name: &str) -> bool {
+        self.config.has_script_globally(name).is_none()
+    }
+
+    async fn forget_script(&mut self, name: &str) {
+        if self.supervisor.contains(name) {
+            if let Err(e) = self.supervisor.stop_script(name).await {
+                tracing::debug!(script = %name, error = ?e, "supervisor.stop during forget_script (ignored)");
+            }
+            self.log_channels
+                .lock()
+                .expect("log_channels mutex poisoned")
+                .remove(name);
+        }
+        self.cron.cancel(name);
+        if let Err(e) = self.state.remove_script(name).await {
+            tracing::error!(script = %name, error = ?e, "Failed to remove from state during forget_script");
+        }
+        self.health.write().await.remove(name);
+    }
+
     async fn reload_config(&mut self, config_path: &Path) -> Result<()> {
         let diff = self.config.reload(config_path)?;
         self.sync_settings(config_path);
 
         for name in diff.removed {
-            tracing::info!(script = %name, "Script removed from config, stopping");
-            if let Err(e) = self.stop_script(&name).await {
-                tracing::error!(script = %name, error = ?e, "Failed to stop during reload");
+            match self.config.has_script_globally(&name) {
+                None => {
+                    tracing::info!(script = %name, "Script removed from config, pruning state and health");
+                    self.forget_script(&name).await;
+                }
+                Some(other_path) => {
+                    tracing::info!(script = %name, surviving = ?other_path, "Script removed from this config but present elsewhere, rebinding");
+                    let was_running = self.supervisor.contains(&name);
+                    let was_explicitly_stopped = self
+                        .state
+                        .scripts
+                        .iter()
+                        .find(|s| s.name == name)
+                        .map(|s| s.explicitly_stopped)
+                        .unwrap_or(false);
+                    if was_running {
+                        if let Err(e) = self.supervisor.stop_script(&name).await {
+                            tracing::error!(script = %name, error = ?e, "Failed to stop supervisor during rebind");
+                        }
+                        self.log_channels
+                            .lock()
+                            .expect("log_channels mutex poisoned")
+                            .remove(&name);
+                        {
+                            let mut snapshot = self.health.write().await;
+                            if let Some(entry) = snapshot.get_mut(&name) {
+                                entry.state = ScriptHealthState::Succeeded;
+                                entry.healthy = true;
+                                entry.last_finished_at = Some(Local::now());
+                                entry.pid = None;
+                            }
+                        }
+                        if let Err(e) = self
+                            .update_script_state_with_config(
+                                &name,
+                                &other_path,
+                                ProcessStatus::Stopped,
+                                false,
+                                None,
+                            )
+                            .await
+                        {
+                            tracing::error!(script = %name, error = ?e, "Failed to persist rebound state");
+                        }
+                    } else if let Some(entry) =
+                        self.state.scripts.iter_mut().find(|s| s.name == name)
+                    {
+                        entry.config_path = Some(other_path.clone());
+                        if let Err(e) = self.state.save().await {
+                            tracing::error!(script = %name, error = ?e, "Failed to persist rebound state");
+                        }
+                    }
+                    self.cron.cancel(&name);
+                    if was_running {
+                        if let Err(e) = self.start_script(&name, &other_path).await {
+                            tracing::error!(script = %name, error = ?e, "Failed to start from rebound config");
+                            {
+                                let mut snapshot = self.health.write().await;
+                                if let Some(entry) = snapshot.get_mut(&name) {
+                                    entry.state = ScriptHealthState::Failed;
+                                    entry.healthy = false;
+                                    entry.last_finished_at = Some(Local::now());
+                                    entry.pid = None;
+                                }
+                            }
+                            if let Err(e) = self
+                                .update_script_state_with_config(
+                                    &name,
+                                    &other_path,
+                                    ProcessStatus::Failed,
+                                    false,
+                                    None,
+                                )
+                                .await
+                            {
+                                tracing::error!(script = %name, error = ?e, "Failed to persist failed rebind state");
+                            }
+                        }
+                    } else if !was_explicitly_stopped {
+                        if let Some(def) = self.config.script(&other_path, &name) {
+                            if let Some(cron_expr) = def.cron.as_ref() {
+                                if !self.cron.is_scheduled(&name) {
+                                    self.cron.schedule(&name, cron_expr);
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            self.state.remove_script(&name).await?;
         }
 
         for name in diff.added {
@@ -897,5 +1077,495 @@ impl DaemonCore {
 
         tracing::info!("Configuration reloaded");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::{NamedTempFile, TempDir};
+
+    fn write_config(content: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    fn make_core() -> (DaemonCore, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let state_file = tmp.path().join("state.json");
+        let log_dir = tmp.path().join("logs");
+        let core = DaemonCore::new(state_file, log_dir).unwrap();
+        (core, tmp)
+    }
+
+    fn dummy_script_state(name: &str, config_path: Option<PathBuf>) -> ScriptState {
+        ScriptState {
+            name: name.to_string(),
+            config_path,
+            status: ProcessStatus::Failed,
+            last_started: None,
+            last_stopped: None,
+            exit_code: Some(1),
+            explicitly_stopped: false,
+            restart_count: 0,
+        }
+    }
+
+    const CONFIG_WITH_FOO: &str = r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  foo:
+    command: "echo foo"
+    restart_policy: "never"
+"#;
+
+    const CONFIG_WITH_BAR: &str = r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  bar:
+    command: "echo bar"
+    restart_policy: "never"
+"#;
+
+    const CONFIG_WITH_BAR_AND_KEEPER: &str = r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  bar:
+    command: "echo bar"
+    restart_policy: "never"
+  keeper:
+    command: "echo keeper"
+    restart_policy: "never"
+"#;
+
+    #[tokio::test]
+    async fn is_orphan_with_empty_config_returns_true() {
+        let (core, _tmp) = make_core();
+        assert!(core.is_orphan("anything"));
+    }
+
+    #[tokio::test]
+    async fn is_orphan_returns_false_when_script_in_loaded_config() {
+        let (mut core, _tmp) = make_core();
+        let cfg = write_config(CONFIG_WITH_FOO);
+        core.config.load(cfg.path()).unwrap();
+
+        assert!(!core.is_orphan("foo"));
+        assert!(core.is_orphan("missing"));
+    }
+
+    #[tokio::test]
+    async fn is_orphan_returns_false_when_script_in_other_loaded_config() {
+        let (mut core, _tmp) = make_core();
+        let cfg_a = write_config(CONFIG_WITH_FOO);
+        let cfg_b = write_config(CONFIG_WITH_BAR);
+        core.config.load(cfg_a.path()).unwrap();
+        core.config.load(cfg_b.path()).unwrap();
+
+        assert!(!core.is_orphan("foo"));
+        assert!(!core.is_orphan("bar"));
+        assert!(core.is_orphan("baz"));
+    }
+
+    #[tokio::test]
+    async fn forget_script_clears_state_and_health() {
+        let (mut core, _tmp) = make_core();
+
+        core.state
+            .update_script(dummy_script_state("ghost", None))
+            .await
+            .unwrap();
+        core.health.write().await.insert(
+            "ghost".to_string(),
+            ScriptHealth {
+                name: "ghost".to_string(),
+                healthy: false,
+                state: ScriptHealthState::Failed,
+                last_exit_code: Some(1),
+                last_run_at: None,
+                last_finished_at: None,
+                pid: None,
+                restart_count: 0,
+            },
+        );
+
+        core.forget_script("ghost").await;
+
+        assert!(core.state.scripts.iter().all(|s| s.name != "ghost"));
+        assert!(!core.health.read().await.contains_key("ghost"));
+    }
+
+    #[tokio::test]
+    async fn forget_script_is_idempotent_on_unknown_name() {
+        let (mut core, _tmp) = make_core();
+        core.forget_script("never-existed").await;
+        assert!(core.state.scripts.is_empty());
+        assert!(core.health.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_process_exit_drops_event_when_supervisor_empty() {
+        let (mut core, _tmp) = make_core();
+
+        core.handle_process_exit("ghost", 42, None).await;
+
+        assert!(
+            core.state.scripts.iter().all(|s| s.name != "ghost"),
+            "exit event for a name not in supervisor must not touch state"
+        );
+        assert!(!core.health.read().await.contains_key("ghost"));
+    }
+
+    #[tokio::test]
+    async fn restore_state_prunes_orphans() {
+        let (mut core, _tmp) = make_core();
+        let cfg = write_config(CONFIG_WITH_FOO);
+
+        core.state
+            .update_script(dummy_script_state(
+                "foo",
+                Some(cfg.path().to_path_buf()),
+            ))
+            .await
+            .unwrap();
+        core.state
+            .update_script(dummy_script_state(
+                "ghost",
+                Some(cfg.path().to_path_buf()),
+            ))
+            .await
+            .unwrap();
+
+        core.restore_state().await.unwrap();
+
+        assert!(core.state.scripts.iter().any(|s| s.name == "foo"));
+        assert!(core.state.scripts.iter().all(|s| s.name != "ghost"));
+        let health = core.health.read().await;
+        assert!(health.contains_key("foo"));
+        assert!(!health.contains_key("ghost"));
+    }
+
+    #[tokio::test]
+    async fn restore_state_keeps_scripts_in_other_config() {
+        let (mut core, _tmp) = make_core();
+        let cfg_a = write_config(CONFIG_WITH_FOO);
+        let cfg_b = write_config(CONFIG_WITH_BAR_AND_KEEPER);
+
+        core.state
+            .update_script(dummy_script_state(
+                "foo",
+                Some(cfg_a.path().to_path_buf()),
+            ))
+            .await
+            .unwrap();
+        core.state
+            .update_script(dummy_script_state(
+                "keeper",
+                Some(cfg_b.path().to_path_buf()),
+            ))
+            .await
+            .unwrap();
+        core.state
+            .update_script(dummy_script_state(
+                "bar",
+                Some(cfg_a.path().to_path_buf()),
+            ))
+            .await
+            .unwrap();
+
+        core.restore_state().await.unwrap();
+
+        assert!(core.state.scripts.iter().any(|s| s.name == "foo"));
+        assert!(core.state.scripts.iter().any(|s| s.name == "keeper"));
+        let bar_entry = core
+            .state
+            .scripts
+            .iter()
+            .find(|s| s.name == "bar")
+            .expect("bar should remain in state");
+        assert_eq!(
+            bar_entry.config_path.as_deref(),
+            Some(cfg_b.path()),
+            "bar should be rebound to cfg_b after restore",
+        );
+        let health = core.health.read().await;
+        assert!(health.contains_key("foo"));
+        assert!(health.contains_key("keeper"));
+        assert!(health.contains_key("bar"));
+    }
+
+    const EMPTY_CONFIG: &str = r#"
+settings:
+  log_dir: "./logs"
+scripts: {}
+"#;
+
+    fn dummy_health(name: &str) -> ScriptHealth {
+        ScriptHealth {
+            name: name.to_string(),
+            healthy: false,
+            state: ScriptHealthState::Failed,
+            last_exit_code: Some(1),
+            last_run_at: None,
+            last_finished_at: None,
+            pid: None,
+            restart_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_removes_from_health() {
+        let (mut core, tmp) = make_core();
+        let cfg_path = tmp.path().join("scripts.yml");
+        std::fs::write(&cfg_path, CONFIG_WITH_FOO).unwrap();
+        core.config.load(&cfg_path).unwrap();
+
+        core.state
+            .update_script(dummy_script_state("foo", Some(cfg_path.clone())))
+            .await
+            .unwrap();
+        core.health
+            .write()
+            .await
+            .insert("foo".to_string(), dummy_health("foo"));
+
+        std::fs::write(&cfg_path, EMPTY_CONFIG).unwrap();
+        core.reload_config(&cfg_path).await.unwrap();
+
+        assert!(core.state.scripts.iter().all(|s| s.name != "foo"));
+        assert!(!core.health.read().await.contains_key("foo"));
+    }
+
+    #[tokio::test]
+    async fn stop_script_updates_health_to_succeeded() {
+        let (mut core, _tmp) = make_core();
+
+        core.state
+            .update_script(dummy_script_state("foo", None))
+            .await
+            .unwrap();
+        core.health.write().await.insert(
+            "foo".to_string(),
+            ScriptHealth {
+                name: "foo".to_string(),
+                healthy: true,
+                state: ScriptHealthState::Running,
+                last_exit_code: None,
+                last_run_at: Some(Local::now()),
+                last_finished_at: None,
+                pid: Some(12345),
+                restart_count: 0,
+            },
+        );
+
+        core.stop_script("foo").await.unwrap();
+
+        let snapshot = core.health.read().await;
+        let entry = snapshot.get("foo").expect("health entry must remain after explicit stop");
+        assert!(entry.healthy, "explicit stop should mark script healthy");
+        assert!(matches!(entry.state, ScriptHealthState::Succeeded));
+        assert_eq!(entry.pid, None, "stale pid must be cleared");
+        assert!(entry.last_finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_script_present_in_other_config() {
+        let (mut core, tmp) = make_core();
+        let cfg_a_path = tmp.path().join("a.yml");
+        let cfg_b_path = tmp.path().join("b.yml");
+        std::fs::write(&cfg_a_path, CONFIG_WITH_FOO).unwrap();
+        std::fs::write(
+            &cfg_b_path,
+            r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  foo:
+    command: "echo foo-from-b"
+    restart_policy: "never"
+"#,
+        )
+        .unwrap();
+        core.config.load(&cfg_a_path).unwrap();
+        core.config.load(&cfg_b_path).unwrap();
+
+        core.state
+            .update_script(dummy_script_state("foo", Some(cfg_a_path.clone())))
+            .await
+            .unwrap();
+        core.health
+            .write()
+            .await
+            .insert("foo".to_string(), dummy_health("foo"));
+
+        std::fs::write(&cfg_a_path, EMPTY_CONFIG).unwrap();
+        core.reload_config(&cfg_a_path).await.unwrap();
+
+        let foo = core
+            .state
+            .scripts
+            .iter()
+            .find(|s| s.name == "foo")
+            .expect("foo must remain in state");
+        assert_eq!(
+            foo.config_path.as_deref(),
+            Some(cfg_b_path.as_path()),
+            "config_path must be rebound to the surviving config"
+        );
+        assert!(
+            !foo.explicitly_stopped,
+            "rebinding to a surviving config must not mark the script as explicitly stopped"
+        );
+        assert!(core.health.read().await.contains_key("foo"));
+    }
+
+    #[tokio::test]
+    async fn reload_rebind_preserves_explicitly_stopped_and_skips_cron() {
+        let (mut core, tmp) = make_core();
+        let cfg_a_path = tmp.path().join("a.yml");
+        let cfg_b_path = tmp.path().join("b.yml");
+        std::fs::write(&cfg_a_path, CONFIG_WITH_FOO).unwrap();
+        std::fs::write(
+            &cfg_b_path,
+            r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  foo:
+    command: "echo foo-from-b"
+    restart_policy: "never"
+    cron: "0 */1 * * * * *"
+"#,
+        )
+        .unwrap();
+        core.config.load(&cfg_a_path).unwrap();
+        core.config.load(&cfg_b_path).unwrap();
+
+        let mut state = dummy_script_state("foo", Some(cfg_a_path.clone()));
+        state.explicitly_stopped = true;
+        state.status = ProcessStatus::Stopped;
+        core.state.update_script(state).await.unwrap();
+        core.health
+            .write()
+            .await
+            .insert("foo".to_string(), dummy_health("foo"));
+
+        std::fs::write(&cfg_a_path, EMPTY_CONFIG).unwrap();
+        core.reload_config(&cfg_a_path).await.unwrap();
+
+        let foo = core
+            .state
+            .scripts
+            .iter()
+            .find(|s| s.name == "foo")
+            .expect("foo must remain in state");
+        assert_eq!(foo.config_path.as_deref(), Some(cfg_b_path.as_path()));
+        assert!(
+            foo.explicitly_stopped,
+            "rebinding a non-running script must not clear explicitly_stopped"
+        );
+        assert!(
+            !core.cron.is_scheduled("foo"),
+            "rebinding an explicitly-stopped script must not schedule its cron"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_state_preserves_entries_when_config_parse_fails() {
+        let (mut core, tmp) = make_core();
+        let cfg_path = tmp.path().join("broken.yml");
+        std::fs::write(&cfg_path, "scripts: [this is not valid yaml: }}}").unwrap();
+
+        core.state
+            .update_script(dummy_script_state("foo", Some(cfg_path.clone())))
+            .await
+            .unwrap();
+
+        core.restore_state().await.unwrap();
+
+        assert!(
+            core.state.scripts.iter().any(|s| s.name == "foo"),
+            "scripts referencing a config that exists but failed to parse must not be pruned"
+        );
+        assert!(
+            !core.health.read().await.contains_key("foo"),
+            "/health should be a projection of currently-loaded configs; parse-failed entries must be omitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_state_keeps_health_when_script_present_in_other_loaded_config_after_parse_failure(
+    ) {
+        let (mut core, tmp) = make_core();
+        let broken_path = tmp.path().join("broken.yml");
+        let working_path = tmp.path().join("working.yml");
+        std::fs::write(&broken_path, "scripts: [this is not valid yaml: }}}").unwrap();
+        std::fs::write(
+            &working_path,
+            r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  foo:
+    command: "echo foo-from-working"
+    restart_policy: "never"
+  bar:
+    command: "echo bar"
+    restart_policy: "never"
+"#,
+        )
+        .unwrap();
+
+        core.state
+            .update_script(dummy_script_state("foo", Some(broken_path.clone())))
+            .await
+            .unwrap();
+        core.state
+            .update_script(dummy_script_state("bar", Some(working_path.clone())))
+            .await
+            .unwrap();
+
+        core.restore_state().await.unwrap();
+
+        let foo = core
+            .state
+            .scripts
+            .iter()
+            .find(|s| s.name == "foo")
+            .expect("foo must remain in state since it exists in another loaded config");
+        assert_eq!(
+            foo.config_path.as_deref(),
+            Some(working_path.as_path()),
+            "foo's config_path must be rebound to the loaded config so it can be restored later"
+        );
+        let health = core.health.read().await;
+        assert!(
+            health.contains_key("foo"),
+            "foo must appear in health since it exists in another loaded config, despite stored config_path failing to parse"
+        );
+        assert!(health.contains_key("bar"));
+    }
+
+    #[tokio::test]
+    async fn restore_state_drops_entries_for_missing_config_file() {
+        let (mut core, tmp) = make_core();
+        let missing_config = tmp.path().join("nonexistent-config.yml");
+
+        core.state
+            .update_script(dummy_script_state("ghost", Some(missing_config)))
+            .await
+            .unwrap();
+
+        core.restore_state().await.unwrap();
+
+        assert!(core.state.scripts.is_empty());
+        let health = core.health.read().await;
+        assert!(!health.contains_key("ghost"));
     }
 }

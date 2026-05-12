@@ -19,6 +19,7 @@ pub struct ProcessSupervisor {
     event_tx: mpsc::Sender<DaemonEvent>,
     log_dir: PathBuf,
     loki_tx: Option<mpsc::Sender<LokiLogEntry>>,
+    next_instance_id: u64,
 }
 
 impl ProcessSupervisor {
@@ -28,6 +29,7 @@ impl ProcessSupervisor {
             event_tx,
             log_dir,
             loki_tx: None,
+            next_instance_id: 1,
         }
     }
 
@@ -103,6 +105,9 @@ impl ProcessSupervisor {
             log_monitor::spawn_stderr_reader(BufReader::new(stderr), logger.tx.clone());
         }
 
+        let instance_id = self.next_instance_id;
+        self.next_instance_id = self.next_instance_id.wrapping_add(1).max(1);
+
         let event_tx = self.event_tx.clone();
         let watcher_name = name.to_string();
         let watcher = tokio::spawn(async move {
@@ -110,6 +115,7 @@ impl ProcessSupervisor {
             let _ = event_tx
                 .send(DaemonEvent::ProcessExited {
                     name: watcher_name,
+                    instance_id,
                     status: status.ok(),
                 })
                 .await;
@@ -119,6 +125,7 @@ impl ProcessSupervisor {
             name.to_string(),
             ManagedProcess {
                 pid,
+                instance_id,
                 status: ProcessStatus::Running,
                 start_time: Some(Local::now()),
                 restart_count: 0,
@@ -138,13 +145,25 @@ impl ProcessSupervisor {
                 // SAFETY: pgid is a valid process group ID set via setpgid in pre_exec
                 unsafe { libc::killpg(pgid, libc::SIGTERM) };
 
-                if let Some(watcher) = process.watcher.take() {
-                    match tokio::time::timeout(Duration::from_secs(5), watcher).await {
+                if let Some(mut watcher) = process.watcher.take() {
+                    match tokio::time::timeout(Duration::from_secs(5), &mut watcher).await {
                         Ok(_) => tracing::debug!(script = %name, "Process group exited after SIGTERM"),
                         Err(_) => {
                             tracing::warn!(script = %name, "SIGTERM timeout, sending SIGKILL to process group");
                             // SAFETY: same pgid, escalating to SIGKILL after SIGTERM timeout
                             unsafe { libc::killpg(pgid, libc::SIGKILL) };
+                            if tokio::time::timeout(Duration::from_secs(2), &mut watcher)
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    script = %name,
+                                    "Process did not exit after SIGKILL, aborting watcher"
+                                );
+                                watcher.abort();
+                            } else {
+                                tracing::debug!(script = %name, "Process group exited after SIGKILL");
+                            }
                         }
                     }
                 }
