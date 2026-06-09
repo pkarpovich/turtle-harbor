@@ -180,6 +180,10 @@ jobs:
               bin.install "turtled"
             end
 
+            def caveats
+              "Daemon runs from a fixed path so Full Disk Access survives upgrades; after 'brew upgrade' run 'th install' to refresh the daemon binary (FDA preserved, no re-grant)."
+            end
+
             test do
               assert_match "turtle-harbor", shell_output("\#{bin}/th --help")
             end
