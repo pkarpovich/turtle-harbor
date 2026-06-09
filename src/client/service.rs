@@ -130,9 +130,6 @@ pub fn install(http_port: Option<u16>) -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 fn install_platform(turtled: &std::path::Path, http_port: Option<u16>) -> anyhow::Result<()> {
     let plist = plist_path();
-    let content = generate_plist(turtled, http_port);
-
-    crate::common::paths::ensure_dir(plist.parent().unwrap())?;
 
     let already_loaded = Command::new("launchctl")
         .args(["list", LABEL])
@@ -147,6 +144,14 @@ fn install_platform(turtled: &std::path::Path, http_port: Option<u16>) -> anyhow
             .status();
     }
 
+    let stable = crate::common::paths::daemon_bin_path();
+    crate::common::paths::ensure_dir(stable.parent().unwrap())?;
+    let _ = std::fs::remove_file(&stable);
+    std::fs::copy(turtled, &stable)?;
+    println!("Installed turtled to {}", stable.display());
+
+    let content = generate_plist(&stable, http_port);
+    crate::common::paths::ensure_dir(plist.parent().unwrap())?;
     let mut file = std::fs::File::create(&plist)?;
     file.write_all(content.as_bytes())?;
     println!("Wrote {}", plist.display());
@@ -160,6 +165,7 @@ fn install_platform(turtled: &std::path::Path, http_port: Option<u16>) -> anyhow
     }
 
     println!("Service installed and started.");
+    println!("  Full Disk Access (grant once): {}", stable.display());
     println!("  Stop:      launchctl bootout gui/$(id -u) {}", plist.display());
     println!("  Uninstall: th uninstall");
     Ok(())
@@ -212,6 +218,7 @@ fn uninstall_platform() -> anyhow::Result<()> {
         .status();
 
     std::fs::remove_file(&plist)?;
+    let _ = std::fs::remove_file(crate::common::paths::daemon_bin_path());
     println!("Service stopped and removed.");
     Ok(())
 }
@@ -236,4 +243,23 @@ fn uninstall_platform() -> anyhow::Result<()> {
 
     println!("Service stopped and removed.");
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plist_points_at_given_turtled_path() {
+        let plist = generate_plist(std::path::Path::new("/stable/turtled"), Some(4242));
+        assert!(plist.contains("<string>/stable/turtled</string>"));
+        assert!(plist.contains("<string>--http-port</string>"));
+        assert!(plist.contains("<string>4242</string>"));
+    }
+
+    #[test]
+    fn plist_without_port_omits_http_port() {
+        let plist = generate_plist(std::path::Path::new("/stable/turtled"), None);
+        assert!(!plist.contains("--http-port"));
+    }
 }

@@ -44,3 +44,18 @@ pub fn log_dir() -> PathBuf {
 pub fn ensure_dir(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
+
+#[cfg(target_os = "macos")]
+pub fn daemon_bin_path() -> PathBuf {
+    data_dir().join("bin").join("turtled")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_bin_path_lives_under_data_dir() {
+        assert!(daemon_bin_path().ends_with("turtle-harbor/bin/turtled"));
+    }
+}
