@@ -44,6 +44,38 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Import signing certificate (macOS)
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Codesign binaries (macOS, Developer ID)
+        if: contains(matrix.target, 'apple-darwin')
+        run: |
+          set -euo pipefail
+          REL="target/${{ matrix.target }}/release"
+          codesign --force --options runtime --timestamp \
+            --identifier com.turtle-harbor.turtled \
+            --sign "Developer ID Application: Pavel Karpovich (GGG699AY79)" "$REL/turtled"
+          codesign --force --options runtime --timestamp \
+            --identifier com.turtle-harbor.th \
+            --sign "Developer ID Application: Pavel Karpovich (GGG699AY79)" "$REL/th"
+          codesign --verify --strict --verbose=2 "$REL/turtled"
+          codesign --verify --strict --verbose=2 "$REL/th"
+
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
