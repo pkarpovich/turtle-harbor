@@ -10,6 +10,7 @@ Supports macOS (ARM/Intel) and Linux (ARM/x86).
 
 - Automatic restart of failed processes
 - Cron-based scheduling
+- NATS JetStream job trigger (one message, one process run, ack/nak by exit code)
 - Process status monitoring
 - Per-script logging
 - Robust state management
@@ -110,6 +111,7 @@ th logs backend
 | env            | Inline environment variables             | Map (optional)    |
 | context        | Working directory for the script         | String (optional) |
 | venv           | Python virtualenv path                   | String (optional) |
+| nats           | NATS JetStream job trigger               | Map (optional)    |
 
 ### Environment Variables
 
@@ -125,6 +127,117 @@ When both are specified, inline `env` values override `env_file` values for the 
 - `always`: Automatically restart on failure
 - `never`: No automatic restart
 
+## NATS job trigger
+
+A script with a `nats:` block is a **job**: the daemon binds a JetStream pull consumer and runs the command once per
+message, with the message in the process environment. The exit code decides whether the message is acknowledged,
+retried or terminated. Between messages the script shows as `listening` in `th ps` - it is a third trigger next to
+`restart_policy` and `cron`, not a long-lived process.
+
+```yaml
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://192.168.198.3:4222"
+
+scripts:
+  podcast-transcriber:
+    command: "python cli.py --job"
+    context: "./podcast-transcriber"
+    venv: ".venv"
+    env_file: ".env"
+    restart_policy: "never"
+    nats:
+      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "podcast-transcriber"
+      ack_wait: "30m"
+      max_deliver: 7
+      nak_delay: "5m"
+      job_timeout: "90m"
+      publish: "recordings.transcribed"
+```
+
+| Field       | Description                                                     | Default    |
+|-------------|-----------------------------------------------------------------|------------|
+| stream      | Existing JetStream stream to consume from                       | required   |
+| subject     | Filter subject for the consumer                                 | required   |
+| durable     | Durable consumer name                                           | required   |
+| ack_wait    | Server ack timeout, applied only when the durable is created    | `30m`      |
+| max_deliver | Delivery limit, applied only when the durable is created        | `5`        |
+| nak_delay   | Delay requested when a message is negatively acknowledged       | `5m`       |
+| job_timeout | Wall-clock limit for one run; the process is stopped past it    | `1h`       |
+| publish     | Subject the job's result is published to before acknowledging   | none       |
+
+`settings.nats.url` is required as soon as any script has a `nats:` block. A `nats:` script may not also set
+`cron:` or `restart_policy: always`, and two scripts across all loaded configs may not share the same
+`(stream, durable)` pair. `stream`, `subject`, `durable` and `publish` are rejected when empty, and `max_deliver`
+may not be `0` - JetStream reads a zero limit as unlimited, which is never what the field is asking for.
+
+### Job environment
+
+Set on top of the script's resolved environment for the one run, overriding `env_file` and `env` on name collision:
+
+| Variable            | Value                                                                      |
+|---------------------|----------------------------------------------------------------------------|
+| `TH_JOB_PAYLOAD`    | message payload, unmodified (a non-UTF-8 payload is terminated, never run) |
+| `TH_JOB_SUBJECT`    | the message's actual subject                                               |
+| `TH_JOB_DELIVERED`  | this message's delivery attempt count                                      |
+| `TH_JOB_MAX_DELIVER`| the server's delivery limit for the consumer                               |
+| `TRACEPARENT`       | forwarded verbatim when the message carries a `traceparent` header         |
+| `TH_JOB_RESULT`     | path to an empty file to write the result into, only when `publish` is set |
+
+With `publish` set, the job must write JSON to `TH_JOB_RESULT` before exiting 0; the daemon publishes those bytes
+(with the traceparent forwarded) and acknowledges only after JetStream confirms the publish. A missing or non-JSON
+result file terminates the message, since a retry would produce the same file. The publish subject must be captured
+by an existing stream - the daemon never creates streams.
+
+### Outcomes
+
+| Outcome                                          | Verdict                                              |
+|--------------------------------------------------|------------------------------------------------------|
+| exit `0`                                         | `Ack`                                                |
+| exit `65`                                        | `Term` - the job declares the message unprocessable  |
+| any other exit code, signal, timeout, publish failure | `Nak` with `nak_delay`, or `Term` once deliveries are exhausted |
+| the job never started, or its reply was lost     | `Nak` - the daemon never terminates the message itself |
+
+The daemon never turns a "never ran" attempt into a `Term`, but JetStream still counts every redelivery: a job that
+repeatedly fails to start eventually exhausts the consumer's `max_deliver` and stops being redelivered.
+
+`th down`, a reload and daemon shutdown nak the in-flight message with zero delay and wait for the server to confirm,
+so a stop never strands a message. While a job runs the daemon sends a progress heartbeat every 30 seconds, so
+`ack_wait` can be far shorter than the job.
+
+### When the server is unreachable
+
+`th up` registers the listener without waiting for a connection, so it succeeds - and `th ps` shows `listening` -
+even when NATS is down or the stream does not exist. The listener retries the whole setup every 30 seconds, logging
+each failure at warn level. A listener that has not bound reports the script as unhealthy on `/health`; that is the
+only place the difference shows. The daemon never creates streams, so a misspelled `stream:` retries forever.
+
+### Stopping and restarting
+
+`th down <job>` naks the in-flight message with zero delay, unregisters the listener so no further messages are
+pulled, and records the script as explicitly stopped - `th ps` then shows `exited` until the next `th up`.
+
+On daemon startup every `nats:` script that was not explicitly stopped has its listener re-registered and is
+persisted as `listening`, whatever its last recorded status was. A job needs no `th up` after a daemon restart; an
+explicitly stopped one stays down.
+
+### Consumer binding
+
+The consumer is created only when it is absent; an existing durable is bound as it is on the server and keeps its
+position and configuration. The YAML `ack_wait` and `max_deliver` therefore apply only at creation - afterwards the
+daemon reads the server's values, uses them for retry decisions and for `TH_JOB_MAX_DELIVER`, and logs a warning once
+per session when the YAML disagrees. Changing them on a live durable is a manual `nats consumer rm` plus recreate.
+A newly created durable starts from `DeliverPolicy::New`, so no history is replayed.
+
+### Status and state file
+
+`th ps` shows `listening` for a registered job between runs and `running` while the process is up. `Listening` is a
+new value in `state.json`: a state file written by this version cannot be read by a daemon older than 0.7.0, so a
+downgrade needs `th down` first.
+
 ## File Locations
 
 ### Production
@@ -134,6 +247,7 @@ When both are specified, inline `env` values override `env_file` values for the 
 | Socket | `~/Library/Application Support/turtle-harbor/daemon.sock` | `$XDG_RUNTIME_DIR/turtle-harbor.sock` |
 | State | `~/Library/Application Support/turtle-harbor/state.json` | `~/.local/share/turtle-harbor/state.json` |
 | Logs | `~/Library/Logs/turtle-harbor/` | `~/.local/share/turtle-harbor/logs/` |
+| Job results | `~/Library/Application Support/turtle-harbor/jobs/` | `~/.local/share/turtle-harbor/jobs/` |
 
 ### Development
 
@@ -142,6 +256,7 @@ When both are specified, inline `env` values override `env_file` values for the 
 | Socket | `/tmp/turtle-harbor.sock` |
 | State | `/tmp/turtle-harbor-state.json` |
 | Logs | `./logs/` |
+| Job results | `/tmp/turtle-harbor-jobs/` |
 
 ## State management
 

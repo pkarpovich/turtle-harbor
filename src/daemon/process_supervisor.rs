@@ -7,12 +7,21 @@ use crate::daemon::loki_shipper::LokiLogEntry;
 use crate::daemon::process::{is_process_alive, ManagedProcess, ScriptStartResult};
 use chrono::Local;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{broadcast, mpsc};
+
+pub struct StartScript<'a> {
+    pub name: &'a str,
+    pub script: &'a Script,
+    pub broadcast_tx: broadcast::Sender<String>,
+    pub config_dir: &'a Path,
+    pub extra_env: HashMap<OsString, OsString>,
+}
 
 pub struct ProcessSupervisor {
     processes: HashMap<String, ManagedProcess>,
@@ -45,7 +54,15 @@ impl ProcessSupervisor {
         &self.log_dir
     }
 
-    pub fn start_script(&mut self, name: &str, script_def: &Script, broadcast_tx: broadcast::Sender<String>, config_dir: &Path) -> Result<ScriptStartResult> {
+    pub fn start_script(&mut self, options: StartScript<'_>) -> Result<ScriptStartResult> {
+        let StartScript {
+            name,
+            script: script_def,
+            broadcast_tx,
+            config_dir,
+            extra_env,
+        } = options;
+
         tracing::info!(
             script = %name,
             command = %script_def.command,
@@ -66,7 +83,12 @@ impl ProcessSupervisor {
 
         let log_path = log_monitor::get_log_path(&self.log_dir, name);
         log_monitor::ensure_log_dir(&self.log_dir)?;
-        let logger = ScriptLogger::new(log_path, broadcast_tx, name.to_string(), self.loki_tx.clone())?;
+        let logger = ScriptLogger::new(
+            log_path,
+            broadcast_tx,
+            name.to_string(),
+            self.loki_tx.clone(),
+        )?;
 
         let mut cmd = TokioCommand::new("sh");
         cmd.arg("-c")
@@ -80,20 +102,23 @@ impl ProcessSupervisor {
         tracing::debug!(script = %name, working_dir = %working_dir.display(), "Setting working directory");
         cmd.current_dir(&working_dir);
 
-        let extra_env = script_def.resolved_env(config_dir);
-        if !extra_env.is_empty() {
-            tracing::debug!(script = %name, env_keys = ?extra_env.keys().collect::<Vec<_>>(), "Injecting environment");
-            cmd.envs(&extra_env);
+        let mut env = script_def.resolved_env(config_dir);
+        for (key, value) in extra_env {
+            env.insert(key, value);
+        }
+        if !env.is_empty() {
+            tracing::debug!(script = %name, env_keys = ?env.keys().collect::<Vec<_>>(), "Injecting environment");
+            cmd.envs(&env);
         }
 
         // SAFETY: pre_exec runs setpgid(0,0) in the forked child before exec — this is
         // async-signal-safe per POSIX and only affects the child process
         let mut child = unsafe {
             cmd.pre_exec(|| {
-                    libc::setpgid(0, 0);
-                    Ok(())
-                })
-                .spawn()?
+                libc::setpgid(0, 0);
+                Ok(())
+            })
+            .spawn()?
         };
 
         let pid = child.id().unwrap_or(0);
@@ -147,7 +172,9 @@ impl ProcessSupervisor {
 
                 if let Some(mut watcher) = process.watcher.take() {
                     match tokio::time::timeout(Duration::from_secs(5), &mut watcher).await {
-                        Ok(_) => tracing::debug!(script = %name, "Process group exited after SIGTERM"),
+                        Ok(_) => {
+                            tracing::debug!(script = %name, "Process group exited after SIGTERM")
+                        }
                         Err(_) => {
                             tracing::warn!(script = %name, "SIGTERM timeout, sending SIGKILL to process group");
                             // SAFETY: same pgid, escalating to SIGKILL after SIGTERM timeout
@@ -261,5 +288,87 @@ impl ProcessSupervisor {
 
     pub fn names(&self) -> Vec<String> {
         self.processes.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::config::RestartPolicy;
+    use tempfile::TempDir;
+
+    fn make_script(command: String, env: Option<HashMap<String, String>>) -> Script {
+        Script {
+            command,
+            restart_policy: RestartPolicy::Never,
+            max_restarts: None,
+            cron: None,
+            context: None,
+            venv: None,
+            env,
+            env_file: None,
+            nats: None,
+        }
+    }
+
+    async fn run_probe(script: Script, extra_env: HashMap<OsString, OsString>) -> String {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("probe.txt");
+        let mut extra_env = extra_env;
+        extra_env.insert(OsString::from("OUT"), OsString::from(&out));
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (broadcast_tx, _broadcast_rx) = broadcast::channel(16);
+        let mut supervisor = ProcessSupervisor::new(event_tx, tmp.path().join("logs"));
+
+        let result = supervisor
+            .start_script(StartScript {
+                name: "probe",
+                script: &script,
+                broadcast_tx,
+                config_dir: tmp.path(),
+                extra_env,
+            })
+            .unwrap();
+        match result {
+            ScriptStartResult::Started => {}
+            ScriptStartResult::AlreadyRunning => panic!("probe script was already running"),
+        }
+
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let DaemonEvent::ProcessExited {
+            name,
+            instance_id: _,
+            status: _,
+        } = event
+        else {
+            panic!("expected a ProcessExited event");
+        };
+        assert_eq!(name, "probe");
+
+        std::fs::read_to_string(&out).unwrap()
+    }
+
+    #[tokio::test]
+    async fn extra_env_reaches_the_process() {
+        let script = make_script(r#"printf "%s" "$TH_PROBE" > "$OUT""#.to_string(), None);
+        let mut extra_env = HashMap::new();
+        extra_env.insert(OsString::from("TH_PROBE"), OsString::from("from_job"));
+
+        assert_eq!(run_probe(script, extra_env).await, "from_job");
+    }
+
+    #[tokio::test]
+    async fn extra_env_overrides_script_env() {
+        let mut env = HashMap::new();
+        env.insert("TH_PROBE".to_string(), "from_script_env".to_string());
+        let script = make_script(r#"printf "%s" "$TH_PROBE" > "$OUT""#.to_string(), Some(env));
+        let mut extra_env = HashMap::new();
+        extra_env.insert(OsString::from("TH_PROBE"), OsString::from("from_job"));
+
+        assert_eq!(run_probe(script, extra_env).await, "from_job");
     }
 }

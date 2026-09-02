@@ -228,4 +228,30 @@ mod tests {
         assert!(state.scripts.is_empty());
         assert!(state.config_path.is_none());
     }
+
+    #[tokio::test]
+    async fn save_and_load_round_trips_listening_status() {
+        let tmp = NamedTempFile::new().unwrap();
+        let state_file = tmp.path().to_path_buf();
+        let mut state = RunningState::new(state_file.clone());
+        state
+            .update_script(ScriptState {
+                name: "job".to_string(),
+                config_path: Some(PathBuf::from("/projects/a/scripts.yml")),
+                status: ProcessStatus::Listening,
+                last_started: None,
+                last_stopped: None,
+                exit_code: Some(0),
+                explicitly_stopped: false,
+                restart_count: 0,
+            })
+            .await
+            .unwrap();
+
+        let state = RunningState::load(&state_file).unwrap();
+
+        assert_eq!(state.scripts.len(), 1);
+        assert_eq!(state.scripts[0].status, ProcessStatus::Listening);
+        assert_eq!(state.scripts[0].exit_code, Some(0));
+    }
 }

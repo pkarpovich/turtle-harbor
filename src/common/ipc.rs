@@ -22,11 +22,25 @@ impl Profile {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Command {
-    Up { name: Option<String>, config_path: std::path::PathBuf },
-    Down { name: Option<String>, config_path: std::path::PathBuf },
-    Ps { config_path: Option<std::path::PathBuf> },
-    Logs { name: Option<String>, tail: u32, follow: bool },
-    Reload { config_path: std::path::PathBuf },
+    Up {
+        name: Option<String>,
+        config_path: std::path::PathBuf,
+    },
+    Down {
+        name: Option<String>,
+        config_path: std::path::PathBuf,
+    },
+    Ps {
+        config_path: Option<std::path::PathBuf>,
+    },
+    Logs {
+        name: Option<String>,
+        tail: u32,
+        follow: bool,
+    },
+    Reload {
+        config_path: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -56,6 +70,7 @@ pub enum ProcessStatus {
     Stopped,
     Failed,
     Restarting,
+    Listening,
 }
 
 async fn send_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<()> {

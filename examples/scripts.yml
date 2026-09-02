@@ -4,6 +4,8 @@ settings:
     url: "http://192.168.198.3:3100"
     labels:
       host: "macbook-air-2022"
+  # nats:
+  #   url: "nats://192.168.198.3:4222"
 
 scripts:
   backend:
@@ -13,3 +15,20 @@ scripts:
     env_file: ".env"
     env:
       LOG_LEVEL: "info"
+
+  # One process run per JetStream message; the exit code acks (0), terms (65)
+  # or naks (anything else) it. Needs settings.nats.url above.
+  # transcriber:
+  #   command: "python cli.py --job"
+  #   context: "./podcast-transcriber"
+  #   venv: ".venv"
+  #   restart_policy: "never"
+  #   nats:
+  #     stream: "recordings"
+  #     subject: "recordings.completed"
+  #     durable: "podcast-transcriber"
+  #     ack_wait: "30m"
+  #     max_deliver: 7
+  #     nak_delay: "5m"
+  #     job_timeout: "90m"
+  #     publish: "recordings.transcribed"

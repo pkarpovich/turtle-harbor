@@ -38,6 +38,34 @@ pub enum Error {
 
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("script '{name}' has a nats trigger and restart_policy 'always'")]
+    JobRestartPolicy { name: String },
+
+    #[error("script '{name}' has both a nats trigger and a cron schedule")]
+    ConflictingTriggers { name: String },
+
+    #[error("script '{name}' has a nats trigger but settings.nats is missing")]
+    NatsUrlMissing { name: String },
+
+    #[error("script '{name}' has an invalid nats trigger: {reason}")]
+    InvalidNatsTrigger { name: String, reason: String },
+
+    #[error("durable '{durable}' on stream '{stream}' already registered from '{path}'")]
+    DuplicateDurable {
+        stream: String,
+        durable: String,
+        path: PathBuf,
+    },
+
+    #[error("job result file {path} is missing or unreadable")]
+    JobResultMissing { path: PathBuf },
+
+    #[error("job result file {path} is not valid JSON: {source}")]
+    JobResultInvalid {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

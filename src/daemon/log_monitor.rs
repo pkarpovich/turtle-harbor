@@ -64,10 +64,7 @@ impl RotatingWriter {
             0
         };
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -192,7 +189,11 @@ where
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    if tx.send(LogLine::Stdout(line.trim_end().to_string())).await.is_err() {
+                    if tx
+                        .send(LogLine::Stdout(line.trim_end().to_string()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -217,7 +218,11 @@ where
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
                 Ok(_) => {
-                    if tx.send(LogLine::Stderr(line.trim_end().to_string())).await.is_err() {
+                    if tx
+                        .send(LogLine::Stderr(line.trim_end().to_string()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -254,7 +259,11 @@ pub fn read_last_n_lines(path: &Path, n: u32) -> std::io::Result<String> {
 
         let newline_count = collected.iter().filter(|&&b| b == b'\n').count();
         let has_trailing_newline = collected.last() == Some(&b'\n');
-        let line_count = if has_trailing_newline { newline_count } else { newline_count + 1 };
+        let line_count = if has_trailing_newline {
+            newline_count
+        } else {
+            newline_count + 1
+        };
 
         if line_count > n || remaining == 0 {
             break;

@@ -7,6 +7,7 @@ pub struct ConfigDiff {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed: Vec<String>,
+    pub nats_url_changed: bool,
 }
 
 pub struct ConfigManager {
@@ -22,7 +23,36 @@ impl ConfigManager {
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
         let config = Config::load(path)?;
+        self.check_durables(path, &config)?;
         self.configs.insert(path.to_path_buf(), config);
+        Ok(())
+    }
+
+    fn check_durables(&self, config_path: &Path, config: &Config) -> Result<()> {
+        let mut owners: HashMap<(&str, &str), &Path> = HashMap::new();
+        for (path, loaded) in &self.configs {
+            if path.as_path() == config_path {
+                continue;
+            }
+            for script in loaded.scripts.values() {
+                let Some(nats) = &script.nats else { continue };
+                owners.insert((&nats.stream, &nats.durable), path.as_path());
+            }
+        }
+
+        for script in config.scripts.values() {
+            let Some(nats) = &script.nats else { continue };
+            let key = (nats.stream.as_str(), nats.durable.as_str());
+            if let Some(owner) = owners.get(&key) {
+                return Err(Error::DuplicateDurable {
+                    stream: nats.stream.clone(),
+                    durable: nats.durable.clone(),
+                    path: owner.to_path_buf(),
+                });
+            }
+            owners.insert(key, config_path);
+        }
+
         Ok(())
     }
 
@@ -56,6 +86,16 @@ impl ConfigManager {
             .is_some_and(|c| c.scripts.contains_key(name))
     }
 
+    pub fn script_owner_excluding(&self, name: &str, skip: &Path) -> Option<PathBuf> {
+        self.configs.iter().find_map(|(path, config)| {
+            if path.as_path() != skip && config.scripts.contains_key(name) {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn has_script_globally(&self, name: &str) -> Option<PathBuf> {
         self.configs.iter().find_map(|(path, config)| {
             if config.scripts.contains_key(name) {
@@ -70,6 +110,13 @@ impl ConfigManager {
         self.configs
             .get(config_path)
             .map(|c| c.settings.log_dir.as_path())
+    }
+
+    pub fn nats_url(&self, config_path: &Path) -> Option<String> {
+        self.configs
+            .get(config_path)
+            .and_then(|c| c.settings.nats.as_ref())
+            .map(|nats| nats.url.clone())
     }
 
     pub fn loki_config(&self, config_path: &Path) -> Option<&LokiConfig> {
@@ -90,17 +137,13 @@ impl ConfigManager {
         let new_config = Config::load(config_path)?;
 
         for name in new_config.scripts.keys() {
-            if let Some(existing) = self
-                .configs
-                .iter()
-                .find_map(|(path, config)| {
-                    if path.as_path() != config_path && config.scripts.contains_key(name) {
-                        Some(path.clone())
-                    } else {
-                        None
-                    }
-                })
-            {
+            if let Some(existing) = self.configs.iter().find_map(|(path, config)| {
+                if path.as_path() != config_path && config.scripts.contains_key(name) {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            }) {
                 return Err(Error::DuplicateScript {
                     name: name.clone(),
                     path: existing,
@@ -108,9 +151,13 @@ impl ConfigManager {
             }
         }
 
+        self.check_durables(config_path, &new_config)?;
+
         self.configs.insert(config_path.to_path_buf(), new_config);
 
         let new_config = self.configs.get(config_path).expect("just inserted");
+
+        let nats_url_changed = old_config.settings.nats != new_config.settings.nats;
 
         let old_names: HashSet<String> = old_config.scripts.keys().cloned().collect();
         let new_names: HashSet<String> = new_config.scripts.keys().cloned().collect();
@@ -128,6 +175,7 @@ impl ConfigManager {
             added,
             removed,
             changed,
+            nats_url_changed,
         })
     }
 }
@@ -317,6 +365,151 @@ scripts:
 
         assert!(mgr.has_script(file_b.path(), "script_b1"));
         assert!(!mgr.has_script(file_b.path(), "script_a1"));
+    }
+
+    fn nats_config(script: &str, stream: &str, durable: &str) -> String {
+        format!(
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://127.0.0.1:4222"
+scripts:
+  {script}:
+    command: "echo job"
+    restart_policy: "never"
+    nats:
+      stream: "{stream}"
+      subject: "recordings.completed"
+      durable: "{durable}"
+"#
+        )
+    }
+
+    #[test]
+    fn load_rejects_same_durable_in_another_config() {
+        let file_a = write_config(&nats_config("job_a", "recordings", "shared"));
+        let file_b = write_config(&nats_config("job_b", "recordings", "shared"));
+        let mut mgr = ConfigManager::new();
+
+        mgr.load(file_a.path()).unwrap();
+        let err = mgr
+            .load(file_b.path())
+            .expect_err("expected DuplicateDurable error");
+
+        match err {
+            Error::DuplicateDurable {
+                stream,
+                durable,
+                path,
+            } => {
+                assert_eq!(stream, "recordings");
+                assert_eq!(durable, "shared");
+                assert_eq!(path, file_a.path());
+            }
+            other => panic!("expected DuplicateDurable error, got {}", other),
+        }
+
+        assert!(!mgr.has_script(file_b.path(), "job_b"));
+    }
+
+    #[test]
+    fn reload_rejects_same_durable_in_another_config() {
+        let file_a = write_config(&nats_config("job_a", "recordings", "shared"));
+        let file_b = write_config(&nats_config("job_b", "recordings", "other"));
+        let mut mgr = ConfigManager::new();
+
+        mgr.load(file_a.path()).unwrap();
+        mgr.load(file_b.path()).unwrap();
+
+        std::fs::write(
+            file_b.path(),
+            nats_config("job_b", "recordings", "shared").as_bytes(),
+        )
+        .unwrap();
+
+        let err = mgr
+            .reload(file_b.path())
+            .err()
+            .expect("expected DuplicateDurable error");
+
+        match err {
+            Error::DuplicateDurable {
+                stream,
+                durable,
+                path,
+            } => {
+                assert_eq!(stream, "recordings");
+                assert_eq!(durable, "shared");
+                assert_eq!(path, file_a.path());
+            }
+            other => panic!("expected DuplicateDurable error, got {}", other),
+        }
+
+        let script = mgr.script(file_b.path(), "job_b").unwrap();
+        assert_eq!(script.nats.as_ref().unwrap().durable, "other");
+    }
+
+    fn nats_config_with_url(script: &str, url: &str) -> String {
+        format!(
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "{url}"
+scripts:
+  {script}:
+    command: "echo job"
+    restart_policy: "never"
+    nats:
+      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "{script}"
+"#
+        )
+    }
+
+    #[test]
+    fn reload_reports_nats_url_change_with_unchanged_scripts() {
+        let file = write_config(&nats_config_with_url("job", "nats://127.0.0.1:4222"));
+        let mut mgr = ConfigManager::new();
+        mgr.load(file.path()).unwrap();
+
+        std::fs::write(
+            file.path(),
+            nats_config_with_url("job", "nats://127.0.0.1:4333").as_bytes(),
+        )
+        .unwrap();
+        let diff = mgr.reload(file.path()).unwrap();
+
+        assert!(diff.nats_url_changed);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.changed.is_empty());
+    }
+
+    #[test]
+    fn reload_without_nats_change_reports_unchanged_url() {
+        let file = write_config(&nats_config_with_url("job", "nats://127.0.0.1:4222"));
+        let mut mgr = ConfigManager::new();
+        mgr.load(file.path()).unwrap();
+
+        let diff = mgr.reload(file.path()).unwrap();
+
+        assert!(!diff.nats_url_changed);
+    }
+
+    #[test]
+    fn same_durable_on_different_streams_accepted() {
+        let file_a = write_config(&nats_config("job_a", "recordings", "shared"));
+        let file_b = write_config(&nats_config("job_b", "meetings", "shared"));
+        let mut mgr = ConfigManager::new();
+
+        mgr.load(file_a.path()).unwrap();
+        mgr.load(file_b.path()).unwrap();
+
+        assert!(mgr.has_script(file_a.path(), "job_a"));
+        assert!(mgr.has_script(file_b.path(), "job_b"));
     }
 
     #[test]

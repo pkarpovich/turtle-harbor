@@ -1,6 +1,6 @@
 [package]
 name = "turtle-harbor"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2021"
 
 [[bin]]
@@ -32,3 +32,6 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 flate2 = "1"
 tar = "0.4"
 tempfile = "3"
+humantime-serde = "1.1"
+async-nats = "0.50"
+futures-util = "0.3"

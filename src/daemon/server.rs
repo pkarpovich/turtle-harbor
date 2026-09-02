@@ -118,7 +118,9 @@ async fn handle_client(
         tracing::info!(command = ?command, "Received command");
 
         let follow_name = match &command {
-            Command::Logs { name, follow: true, .. } => name.clone(),
+            Command::Logs {
+                name, follow: true, ..
+            } => name.clone(),
             _ => None,
         };
 

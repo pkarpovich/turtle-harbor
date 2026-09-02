@@ -25,11 +25,43 @@ pub fn handle_error(error: Error) -> ! {
             path.display()
         ),
         Error::ConfigNotLoaded => "No configuration loaded - run 'th up' first".to_string(),
-        Error::CronParse {
-            expression,
-            source,
-        } => format!("Invalid cron '{}': {}", expression, source),
+        Error::CronParse { expression, source } => {
+            format!("Invalid cron '{}': {}", expression, source)
+        }
         Error::Json(e) => format!("JSON error: {}", e),
+        Error::JobRestartPolicy { name } => format!(
+            "Script '{}' cannot use a nats trigger with restart_policy 'always'",
+            name
+        ),
+        Error::ConflictingTriggers { name } => format!(
+            "Script '{}' cannot use a nats trigger and a cron schedule at once",
+            name
+        ),
+        Error::NatsUrlMissing { name } => format!(
+            "Script '{}' has a nats trigger but settings.nats is missing",
+            name
+        ),
+        Error::InvalidNatsTrigger { name, reason } => {
+            format!("Script '{}' has an invalid nats trigger: {}", name, reason)
+        }
+        Error::DuplicateDurable {
+            stream,
+            durable,
+            path,
+        } => format!(
+            "Durable '{}' on stream '{}' already registered from '{}'",
+            durable,
+            stream,
+            path.display()
+        ),
+        Error::JobResultMissing { path } => {
+            format!("Job result file {} is missing", path.display())
+        }
+        Error::JobResultInvalid { path, source } => format!(
+            "Job result file {} is not valid JSON: {}",
+            path.display(),
+            source
+        ),
     };
 
     eprintln!("{}", message);

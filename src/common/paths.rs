@@ -28,6 +28,17 @@ pub fn state_file() -> PathBuf {
     }
 }
 
+pub fn jobs_dir() -> PathBuf {
+    match Profile::current() {
+        Profile::Development => PathBuf::from("/tmp/turtle-harbor-jobs"),
+        Profile::Production => data_dir().join("jobs"),
+    }
+}
+
+pub fn result_path(name: &str) -> PathBuf {
+    jobs_dir().join(format!("{}.result.json", name))
+}
+
 pub fn log_dir() -> PathBuf {
     match Profile::current() {
         Profile::Development => PathBuf::from("logs"),
@@ -50,12 +61,20 @@ pub fn daemon_bin_path() -> PathBuf {
     data_dir().join("bin").join("turtled")
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn daemon_bin_path_lives_under_data_dir() {
         assert!(daemon_bin_path().ends_with("turtle-harbor/bin/turtled"));
+    }
+
+    #[test]
+    fn result_path_lives_under_jobs_dir() {
+        let path = result_path("x");
+        assert!(path.ends_with("x.result.json"));
+        assert_eq!(path.parent(), Some(jobs_dir().as_path()));
     }
 }
