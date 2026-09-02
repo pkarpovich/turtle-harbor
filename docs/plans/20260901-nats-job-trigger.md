@@ -322,11 +322,11 @@ A new variant, persisted in `state.json`. `th ps` renders it as `listening` (dim
 - Modify: `src/daemon/process_supervisor.rs`
 - Modify: `src/daemon/daemon_core.rs` (three call sites: `handle_restart_after_backoff`, `handle_cron_tick`, `start_script`)
 
-- [ ] introduce `StartScript<'a> { name: &'a str, script: &'a Script, broadcast_tx: broadcast::Sender<String>, config_dir: &'a Path, extra_env: HashMap<OsString, OsString> }` and change `start_script` to take it
-- [ ] apply `extra_env` after `resolved_env` so job variables win over `env_file`/`env`
-- [ ] update the three existing call sites with an empty `extra_env`
-- [ ] write a process test: start `sh -c 'printf "%s" "$TH_PROBE" > "$OUT"'` with `extra_env` carrying `TH_PROBE` and an `OUT` path inside a `TempDir`, wait for `ProcessExited` on the event channel, assert the file content; and a second test that a `Script.env` value is overridden by `extra_env` of the same name
-- [ ] run `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` - must pass before Task 6
+- [x] introduce `StartScript<'a> { name: &'a str, script: &'a Script, broadcast_tx: broadcast::Sender<String>, config_dir: &'a Path, extra_env: HashMap<OsString, OsString> }` and change `start_script` to take it
+- [x] apply `extra_env` after `resolved_env` so job variables win over `env_file`/`env`
+- [x] update the three existing call sites with an empty `extra_env`
+- [x] write a process test: start `sh -c 'printf "%s" "$TH_PROBE" > "$OUT"'` with `extra_env` carrying `TH_PROBE` and an `OUT` path inside a `TempDir`, wait for `ProcessExited` on the event channel, assert the file content; and a second test that a `Script.env` value is overridden by `extra_env` of the same name
+- [x] run `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` - must pass before Task 6
 
 ### Task 6: Job and listener events in `DaemonCore`
 

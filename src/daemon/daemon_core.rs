@@ -7,7 +7,7 @@ use crate::daemon::health::{self, HealthSnapshot, ScriptHealth, ScriptHealthStat
 use crate::daemon::log_monitor;
 use crate::daemon::loki_shipper::{self, LokiLogEntry, LokiShipper};
 use crate::daemon::process::ScriptStartResult;
-use crate::daemon::process_supervisor::ProcessSupervisor;
+use crate::daemon::process_supervisor::{ProcessSupervisor, StartScript};
 use crate::daemon::state::{RunningState, ScriptState};
 use chrono::Local;
 use std::collections::{HashMap, HashSet};
@@ -454,10 +454,13 @@ impl DaemonCore {
         tracing::info!(script = %name, restart_count, "Executing restart after backoff");
         let config_dir = self.config.config_dir(&config_path);
         let broadcast_tx = self.register_log_channel(name);
-        match self
-            .supervisor
-            .start_script(name, &script_def, broadcast_tx, &config_dir)
-        {
+        match self.supervisor.start_script(StartScript {
+            name,
+            script: &script_def,
+            broadcast_tx,
+            config_dir: &config_dir,
+            extra_env: HashMap::new(),
+        }) {
             Ok(ScriptStartResult::Started) => {
                 if let Some(proc) = self.supervisor.get_mut(name) {
                     proc.restart_count = restart_count;
@@ -495,10 +498,13 @@ impl DaemonCore {
 
         let config_dir = self.config.config_dir(&config_path);
         let broadcast_tx = self.register_log_channel(name);
-        match self
-            .supervisor
-            .start_script(name, &script_def, broadcast_tx, &config_dir)
-        {
+        match self.supervisor.start_script(StartScript {
+            name,
+            script: &script_def,
+            broadcast_tx,
+            config_dir: &config_dir,
+            extra_env: HashMap::new(),
+        }) {
             Ok(ScriptStartResult::Started) => {
                 tracing::info!(script = %name, "Cron-triggered script started");
                 self.update_health_on_start(name).await;
@@ -602,9 +608,13 @@ impl DaemonCore {
         let cron = script_def.cron.clone();
         let config_dir = self.config.config_dir(config_path);
         let broadcast_tx = self.register_log_channel(name);
-        let result = self
-            .supervisor
-            .start_script(name, &script_def, broadcast_tx, &config_dir)?;
+        let result = self.supervisor.start_script(StartScript {
+            name,
+            script: &script_def,
+            broadcast_tx,
+            config_dir: &config_dir,
+            extra_env: HashMap::new(),
+        })?;
 
         if matches!(result, ScriptStartResult::Started) {
             self.update_health_on_start(name).await;
