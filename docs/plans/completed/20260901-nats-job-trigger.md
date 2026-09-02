@@ -413,11 +413,12 @@ Verification record (Task 1 commit is `7e4858e`):
 - Modify: `examples/scripts.yml`
 - Modify: `Cargo.toml`
 
-- [ ] add a "NATS job trigger" section to `README.md`: the config block, the environment table, the outcome table, the `Listening` status, the binding rule (server values win, YAML `ack_wait`/`max_deliver` apply only on creation), `DeliverPolicy::New`, the publish-stream prerequisite and the state-file downgrade note
-- [ ] add `NatsManager`, `job.rs`, the four new `DaemonEvent` variants and the `Listening` status to the architecture section of `CLAUDE.md`
-- [ ] add a commented `nats:` script to `examples/scripts.yml`
-- [ ] bump `Cargo.toml` version to `0.7.0`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] add a "NATS job trigger" section to `README.md`: the config block, the environment table, the outcome table, the `Listening` status, the binding rule (server values win, YAML `ack_wait`/`max_deliver` apply only on creation), `DeliverPolicy::New`, the publish-stream prerequisite and the state-file downgrade note
+- [x] add `NatsManager`, `job.rs`, the four new `DaemonEvent` variants and the `Listening` status to the architecture section of `CLAUDE.md`
+- [x] add a commented `nats:` script to `examples/scripts.yml`
+- [x] bump `Cargo.toml` version to `0.7.0`
+- [x] move this plan to `docs/plans/completed/`
+- ➕ `README.md` also gained the job-results directory in both File Locations tables, since `TH_JOB_RESULT` points into it.
 
 ## Post-Completion
 
