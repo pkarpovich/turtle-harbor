@@ -15,10 +15,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 const TRACEPARENT_HEADER: &str = "traceparent";
-const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(15);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const BATCH_EXPIRES: Duration = Duration::from_secs(60);
-const BATCH_HEARTBEAT: Duration = Duration::from_secs(20);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const TIMEOUT_GRACE: Duration = Duration::from_secs(10);
 const SHUTDOWN_DRAIN: Duration = Duration::from_millis(500);
@@ -140,7 +139,7 @@ impl NatsManager {
         }
 
         let deadline = tokio::time::Instant::now() + CANCEL_TIMEOUT;
-        for (name, handle) in stopping {
+        let waits = stopping.into_iter().map(|(name, handle)| async move {
             let abort = handle.abort_handle();
             match tokio::time::timeout_at(deadline, handle).await {
                 Ok(_) => {
@@ -151,7 +150,8 @@ impl NatsManager {
                     tracing::warn!(script = %name, "Listener did not stop in time, aborted");
                 }
             }
-        }
+        });
+        futures_util::future::join_all(waits).await;
     }
 
     pub fn is_listening(&self, name: &str) -> bool {
@@ -353,7 +353,6 @@ impl Session {
             .batch()
             .max_messages(1)
             .expires(BATCH_EXPIRES)
-            .heartbeat(BATCH_HEARTBEAT)
             .messages()
             .await;
 
@@ -449,6 +448,7 @@ impl Session {
             })
             .await;
         let Ok(()) = sent else {
+            self.nak_now(&message).await;
             self.remove_result_file(&attempt);
             return AfterMessage::Stop;
         };
