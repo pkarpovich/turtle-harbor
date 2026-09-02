@@ -4,6 +4,7 @@ use crate::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
 use crate::daemon::config_manager::ConfigManager;
 use crate::daemon::cron_manager::CronManager;
 use crate::daemon::health::{self, HealthSnapshot, ScriptHealth, ScriptHealthState};
+use crate::daemon::job::JobOutcome;
 use crate::daemon::log_monitor;
 use crate::daemon::loki_shipper::{self, LokiLogEntry, LokiShipper};
 use crate::daemon::process::ScriptStartResult;
@@ -11,6 +12,7 @@ use crate::daemon::process_supervisor::{ProcessSupervisor, StartScript};
 use crate::daemon::state::{RunningState, ScriptState};
 use chrono::Local;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -36,6 +38,25 @@ pub enum DaemonEvent {
     CronTick {
         name: String,
     },
+    #[allow(dead_code)]
+    JobTrigger {
+        name: String,
+        env: HashMap<OsString, OsString>,
+        reply_tx: oneshot::Sender<JobOutcome>,
+    },
+    #[allow(dead_code)]
+    JobTimeout {
+        name: String,
+    },
+    #[allow(dead_code)]
+    ListenerReady {
+        name: String,
+    },
+    #[allow(dead_code)]
+    ListenerFailed {
+        name: String,
+        error: String,
+    },
     Shutdown,
 }
 
@@ -58,6 +79,7 @@ pub struct DaemonCore {
     log_channels: LogChannels,
     health: HealthSnapshot,
     loki_tx: Option<mpsc::Sender<LokiLogEntry>>,
+    pending_jobs: HashMap<String, oneshot::Sender<JobOutcome>>,
 }
 
 impl DaemonCore {
@@ -84,6 +106,7 @@ impl DaemonCore {
             log_channels,
             health,
             loki_tx: None,
+            pending_jobs: HashMap::new(),
         })
     }
 
@@ -134,6 +157,22 @@ impl DaemonCore {
                 }
                 DaemonEvent::CronTick { name } => {
                     self.handle_cron_tick(&name).await;
+                }
+                DaemonEvent::JobTrigger {
+                    name,
+                    env,
+                    reply_tx,
+                } => {
+                    self.handle_job_trigger(&name, env, reply_tx).await;
+                }
+                DaemonEvent::JobTimeout { name } => {
+                    self.handle_job_timeout(&name).await;
+                }
+                DaemonEvent::ListenerReady { name } => {
+                    self.handle_listener_ready(&name).await;
+                }
+                DaemonEvent::ListenerFailed { name, error } => {
+                    self.handle_listener_failed(&name, &error).await;
                 }
                 DaemonEvent::Shutdown => {
                     tracing::info!("Shutdown event received");
@@ -345,6 +384,15 @@ impl DaemonCore {
         let exit_code = status.and_then(|s| s.code());
         let succeeded = status.map(|s| s.success()).unwrap_or(false);
 
+        if let Some(reply_tx) = self.pending_jobs.remove(name) {
+            let outcome = match exit_code {
+                Some(code) => JobOutcome::Exited(code),
+                None => JobOutcome::Signaled,
+            };
+            tracing::info!(script = %name, ?outcome, "Resolving job with process outcome");
+            let _ = reply_tx.send(outcome);
+        }
+
         if succeeded {
             if let Some(proc) = self.supervisor.get_mut(name) {
                 proc.restart_count = 0;
@@ -366,7 +414,9 @@ impl DaemonCore {
             }
         }
 
-        let persist_status = if succeeded {
+        let persist_status = if self.is_job(name) {
+            ProcessStatus::Listening
+        } else if succeeded {
             ProcessStatus::Stopped
         } else {
             ProcessStatus::Failed
@@ -522,6 +572,134 @@ impl DaemonCore {
                 tracing::error!(script = %name, error = ?e, "Cron-triggered start failed");
             }
         }
+    }
+
+    fn is_job(&self, name: &str) -> bool {
+        let Some(config_path) = self.script_config_path(name) else {
+            return false;
+        };
+        let Some(script_def) = self.config.script(&config_path, name) else {
+            return false;
+        };
+        script_def.nats.is_some()
+    }
+
+    async fn handle_job_trigger(
+        &mut self,
+        name: &str,
+        env: HashMap<OsString, OsString>,
+        reply_tx: oneshot::Sender<JobOutcome>,
+    ) {
+        let explicitly_stopped = self
+            .state
+            .scripts
+            .iter()
+            .any(|s| s.name == name && s.explicitly_stopped);
+        if explicitly_stopped {
+            tracing::info!(script = %name, "Job trigger declined - script explicitly stopped");
+            let _ = reply_tx.send(JobOutcome::NotStarted);
+            return;
+        }
+
+        let Some(config_path) = self.script_config_path(name) else {
+            tracing::info!(script = %name, "Job trigger declined - no config path");
+            let _ = reply_tx.send(JobOutcome::NotStarted);
+            return;
+        };
+
+        if !self.config.has_script(&config_path, name) {
+            tracing::info!(script = %name, "Job trigger declined - script removed from config");
+            let _ = reply_tx.send(JobOutcome::NotStarted);
+            return;
+        }
+
+        let Some(script_def) = self.config.script(&config_path, name).cloned() else {
+            tracing::info!(script = %name, "Job trigger declined - definition unavailable");
+            let _ = reply_tx.send(JobOutcome::NotStarted);
+            return;
+        };
+
+        let config_dir = self.config.config_dir(&config_path);
+        let broadcast_tx = self.register_log_channel(name);
+        match self.supervisor.start_script(StartScript {
+            name,
+            script: &script_def,
+            broadcast_tx,
+            config_dir: &config_dir,
+            extra_env: env,
+        }) {
+            Ok(ScriptStartResult::Started) => {
+                tracing::info!(script = %name, "Job-triggered script started");
+                self.pending_jobs.insert(name.to_string(), reply_tx);
+                self.update_health_on_start(name).await;
+                if let Err(e) = self
+                    .update_script_state(name, ProcessStatus::Running, false, None)
+                    .await
+                {
+                    tracing::error!(script = %name, error = ?e, "Failed to update state after job start");
+                }
+            }
+            Ok(ScriptStartResult::AlreadyRunning) => {
+                tracing::warn!(script = %name, "Job trigger declined - script already running");
+                let _ = reply_tx.send(JobOutcome::NotStarted);
+            }
+            Err(e) => {
+                tracing::error!(script = %name, error = ?e, "Job-triggered start failed");
+                let _ = reply_tx.send(JobOutcome::NotStarted);
+            }
+        }
+    }
+
+    async fn handle_job_timeout(&mut self, name: &str) {
+        tracing::error!(script = %name, "Job timed out - stopping process");
+
+        if let Some(reply_tx) = self.pending_jobs.remove(name) {
+            let _ = reply_tx.send(JobOutcome::TimedOut);
+        }
+
+        {
+            let mut snapshot = self.health.write().await;
+            if let Some(entry) = snapshot.get_mut(name) {
+                entry.state = ScriptHealthState::Failed;
+                entry.healthy = false;
+                entry.last_finished_at = Some(Local::now());
+                entry.pid = None;
+            }
+        }
+
+        if let Err(e) = self
+            .update_script_state(name, ProcessStatus::Listening, false, None)
+            .await
+        {
+            tracing::error!(script = %name, error = ?e, "Failed to persist state on job timeout");
+        }
+
+        if let Err(e) = self.supervisor.stop_script(name).await {
+            tracing::error!(script = %name, error = ?e, "Failed to stop timed-out job");
+        }
+    }
+
+    async fn handle_listener_ready(&mut self, name: &str) {
+        tracing::info!(script = %name, "NATS listener ready");
+        let mut snapshot = self.health.write().await;
+        let entry = snapshot
+            .entry(name.to_string())
+            .or_insert_with(|| ScriptHealth::never_ran(name.to_string()));
+        entry.healthy = true;
+        if entry.last_run_at.is_none() {
+            entry.state = ScriptHealthState::NeverRan;
+        }
+    }
+
+    async fn handle_listener_failed(&mut self, name: &str, error: &str) {
+        tracing::warn!(script = %name, error, "NATS listener failed");
+        let mut snapshot = self.health.write().await;
+        let entry = snapshot
+            .entry(name.to_string())
+            .or_insert_with(|| ScriptHealth::never_ran(name.to_string()));
+        entry.healthy = false;
+        entry.state = ScriptHealthState::Failed;
+        entry.last_exit_code = None;
     }
 
     async fn start_scripts(&mut self, name: Option<String>, config_path: &Path) -> Result<()> {
@@ -1555,6 +1733,205 @@ scripts:
             "foo must appear in health since it exists in another loaded config, despite stored config_path failing to parse"
         );
         assert!(health.contains_key("bar"));
+    }
+
+    fn job_config(command: &str) -> String {
+        format!(
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://127.0.0.1:14222"
+scripts:
+  job:
+    command: "{command}"
+    restart_policy: "never"
+    nats:
+      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "job"
+"#
+        )
+    }
+
+    async fn setup_job_core(command: &str) -> (DaemonCore, TempDir, PathBuf) {
+        let (mut core, tmp) = make_core();
+        let cfg_path = tmp.path().join("jobs.yml");
+        std::fs::write(&cfg_path, job_config(command)).unwrap();
+        core.config.load(&cfg_path).unwrap();
+        core.state
+            .update_script(dummy_script_state("job", Some(cfg_path.clone())))
+            .await
+            .unwrap();
+        (core, tmp, cfg_path)
+    }
+
+    fn job_env() -> HashMap<OsString, OsString> {
+        let mut env = HashMap::new();
+        env.insert(OsString::from("TH_JOB_PAYLOAD"), OsString::from("{}"));
+        env
+    }
+
+    fn is_failed(state: &ScriptHealthState) -> bool {
+        match state {
+            ScriptHealthState::Failed => true,
+            ScriptHealthState::Running => false,
+            ScriptHealthState::Succeeded => false,
+            ScriptHealthState::NeverRan => false,
+        }
+    }
+
+    async fn drain_process_exit(core: &mut DaemonCore) {
+        let event = tokio::time::timeout(Duration::from_secs(5), core.event_rx.recv())
+            .await
+            .expect("timed out waiting for ProcessExited")
+            .expect("event channel closed");
+        let DaemonEvent::ProcessExited {
+            name,
+            instance_id,
+            status,
+        } = event
+        else {
+            panic!("expected a ProcessExited event");
+        };
+        core.handle_process_exit(&name, instance_id, status).await;
+    }
+
+    #[tokio::test]
+    async fn job_trigger_resolves_reply_with_exit_code_and_persists_listening() {
+        let (mut core, _tmp, _cfg) = setup_job_core("exit 65").await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+        drain_process_exit(&mut core).await;
+
+        assert_eq!(reply_rx.await.unwrap(), JobOutcome::Exited(65));
+
+        let entry = core
+            .state
+            .scripts
+            .iter()
+            .find(|s| s.name == "job")
+            .expect("job must remain in state");
+        assert_eq!(entry.status, ProcessStatus::Listening);
+        assert_eq!(entry.exit_code, Some(65));
+        assert!(core.pending_jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn job_trigger_while_running_replies_not_started() {
+        let (mut core, _tmp, _cfg) = setup_job_core("sleep 5").await;
+
+        let (first_tx, _first_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), first_tx).await;
+        let first_instance = core
+            .supervisor
+            .get("job")
+            .expect("supervisor must hold the first job")
+            .instance_id;
+
+        let (second_tx, second_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), second_tx).await;
+
+        assert_eq!(second_rx.await.unwrap(), JobOutcome::NotStarted);
+        assert_eq!(
+            core.supervisor.get("job").map(|p| p.instance_id),
+            Some(first_instance),
+            "the running instance must be untouched by the declined trigger"
+        );
+
+        core.supervisor.stop_script("job").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_trigger_for_explicitly_stopped_script_replies_not_started() {
+        let (mut core, tmp, cfg_path) = setup_job_core("exit 0").await;
+
+        let mut state = dummy_script_state("job", Some(cfg_path));
+        state.status = ProcessStatus::Stopped;
+        state.explicitly_stopped = true;
+        core.state.update_script(state).await.unwrap();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+
+        assert_eq!(reply_rx.await.unwrap(), JobOutcome::NotStarted);
+        assert!(!core.supervisor.contains("job"));
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn job_trigger_for_unknown_script_replies_not_started() {
+        let (mut core, _tmp) = make_core();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("ghost", job_env(), reply_tx).await;
+
+        assert_eq!(reply_rx.await.unwrap(), JobOutcome::NotStarted);
+        assert!(!core.supervisor.contains("ghost"));
+    }
+
+    #[tokio::test]
+    async fn stale_process_exit_leaves_pending_job_untouched() {
+        let (mut core, _tmp) = make_core();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.pending_jobs.insert("job".to_string(), reply_tx);
+
+        core.handle_process_exit("job", 999, None).await;
+
+        assert!(core.pending_jobs.contains_key("job"));
+        drop(reply_rx);
+    }
+
+    #[tokio::test]
+    async fn job_timeout_replies_timed_out_and_stops_the_process() {
+        let (mut core, _tmp, _cfg) = setup_job_core("sleep 30").await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+        assert!(core.supervisor.contains("job"));
+
+        core.handle_job_timeout("job").await;
+
+        assert_eq!(reply_rx.await.unwrap(), JobOutcome::TimedOut);
+        assert!(!core.supervisor.contains("job"));
+
+        let entry = core
+            .state
+            .scripts
+            .iter()
+            .find(|s| s.name == "job")
+            .expect("job must remain in state");
+        assert_eq!(entry.status, ProcessStatus::Listening);
+        assert_eq!(entry.exit_code, None);
+
+        let snapshot = core.health.read().await;
+        let health = snapshot.get("job").expect("health entry must exist");
+        assert!(!health.healthy);
+        assert!(is_failed(&health.state));
+        assert_eq!(health.pid, None);
+    }
+
+    #[tokio::test]
+    async fn listener_failed_then_ready_toggles_health() {
+        let (mut core, _tmp) = make_core();
+
+        core.handle_listener_failed("job", "connection refused")
+            .await;
+        {
+            let snapshot = core.health.read().await;
+            let health = snapshot.get("job").expect("health entry must exist");
+            assert!(!health.healthy);
+            assert!(is_failed(&health.state));
+            assert_eq!(health.last_exit_code, None);
+        }
+
+        core.handle_listener_ready("job").await;
+        let snapshot = core.health.read().await;
+        let health = snapshot.get("job").expect("health entry must exist");
+        assert!(health.healthy);
+        assert!(!is_failed(&health.state));
     }
 
     #[tokio::test]
