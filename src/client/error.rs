@@ -29,6 +29,28 @@ pub fn handle_error(error: Error) -> ! {
             format!("Invalid cron '{}': {}", expression, source)
         }
         Error::Json(e) => format!("JSON error: {}", e),
+        Error::JobRestartPolicy { name } => format!(
+            "Script '{}' cannot use a nats trigger with restart_policy 'always'",
+            name
+        ),
+        Error::ConflictingTriggers { name } => format!(
+            "Script '{}' cannot use a nats trigger and a cron schedule at once",
+            name
+        ),
+        Error::NatsUrlMissing { name } => format!(
+            "Script '{}' has a nats trigger but settings.nats is missing",
+            name
+        ),
+        Error::DuplicateDurable {
+            stream,
+            durable,
+            path,
+        } => format!(
+            "Durable '{}' on stream '{}' already registered from '{}'",
+            durable,
+            stream,
+            path.display()
+        ),
     };
 
     eprintln!("{}", message);

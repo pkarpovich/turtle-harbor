@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const DEFAULT_MAX_RESTARTS: u32 = 5;
 const DEFAULT_MAX_RESTARTS_CRON: u32 = 3;
@@ -20,11 +21,51 @@ pub struct LokiConfig {
     pub labels: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct NatsSettings {
+    pub url: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
     pub log_dir: PathBuf,
     #[serde(default)]
     pub loki: Option<LokiConfig>,
+    #[serde(default)]
+    pub nats: Option<NatsSettings>,
+}
+
+fn default_ack_wait() -> Duration {
+    Duration::from_secs(30 * 60)
+}
+
+fn default_max_deliver() -> u32 {
+    5
+}
+
+fn default_nak_delay() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+
+fn default_job_timeout() -> Duration {
+    Duration::from_secs(60 * 60)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct NatsTrigger {
+    pub stream: String,
+    pub subject: String,
+    pub durable: String,
+    #[serde(with = "humantime_serde", default = "default_ack_wait")]
+    pub ack_wait: Duration,
+    #[serde(default = "default_max_deliver")]
+    pub max_deliver: u32,
+    #[serde(with = "humantime_serde", default = "default_nak_delay")]
+    pub nak_delay: Duration,
+    #[serde(with = "humantime_serde", default = "default_job_timeout")]
+    pub job_timeout: Duration,
+    #[serde(default)]
+    pub publish: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -42,6 +83,8 @@ pub struct Script {
     pub env: Option<HashMap<String, String>>,
     #[serde(default)]
     pub env_file: Option<PathBuf>,
+    #[serde(default)]
+    pub nats: Option<NatsTrigger>,
 }
 
 impl Script {
@@ -174,8 +217,30 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        let config = serde_yaml_ng::from_str(&content)?;
+        let config: Config = serde_yaml_ng::from_str(&content)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (name, script) in &self.scripts {
+            if script.nats.is_none() {
+                continue;
+            }
+            match script.restart_policy {
+                RestartPolicy::Always => {
+                    return Err(Error::JobRestartPolicy { name: name.clone() })
+                }
+                RestartPolicy::Never => {}
+            }
+            if script.cron.is_some() {
+                return Err(Error::ConflictingTriggers { name: name.clone() });
+            }
+            if self.settings.nats.is_none() {
+                return Err(Error::NatsUrlMissing { name: name.clone() });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -281,7 +346,189 @@ mod tests {
             venv: None,
             env,
             env_file,
+            nats: None,
         }
+    }
+
+    fn load_yaml(content: &str) -> Result<Config> {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.flush().unwrap();
+        Config::load(file.path())
+    }
+
+    const NATS_FULL: &str = r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://127.0.0.1:4222"
+scripts:
+  transcriber:
+    command: "python cli.py --job"
+    restart_policy: "never"
+    nats:
+      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "transcriber"
+      ack_wait: "30m"
+      max_deliver: 7
+      nak_delay: "5m"
+      job_timeout: "90m"
+      publish: "recordings.transcribed"
+"#;
+
+    #[test]
+    fn nats_block_parses_every_field() {
+        let config = load_yaml(NATS_FULL).unwrap();
+        assert_eq!(
+            config.settings.nats.unwrap().url,
+            "nats://127.0.0.1:4222".to_string()
+        );
+
+        let nats = config.scripts["transcriber"].nats.clone().unwrap();
+        assert_eq!(nats.stream, "recordings");
+        assert_eq!(nats.subject, "recordings.completed");
+        assert_eq!(nats.durable, "transcriber");
+        assert_eq!(nats.ack_wait, Duration::from_secs(1800));
+        assert_eq!(nats.max_deliver, 7);
+        assert_eq!(nats.nak_delay, Duration::from_secs(300));
+        assert_eq!(nats.job_timeout, Duration::from_secs(5400));
+        assert_eq!(nats.publish.as_deref(), Some("recordings.transcribed"));
+    }
+
+    #[test]
+    fn nats_block_optional_fields_take_defaults() {
+        let config = load_yaml(
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://127.0.0.1:4222"
+scripts:
+  transcriber:
+    command: "echo job"
+    restart_policy: "never"
+    nats:
+      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "transcriber"
+"#,
+        )
+        .unwrap();
+
+        let nats = config.scripts["transcriber"].nats.clone().unwrap();
+        assert_eq!(nats.ack_wait, Duration::from_secs(1800));
+        assert_eq!(nats.max_deliver, 5);
+        assert_eq!(nats.nak_delay, Duration::from_secs(300));
+        assert_eq!(nats.job_timeout, Duration::from_secs(3600));
+        assert!(nats.publish.is_none());
+    }
+
+    #[test]
+    fn nats_with_restart_policy_always_rejected() {
+        let err = load_yaml(
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://127.0.0.1:4222"
+scripts:
+  transcriber:
+    command: "echo job"
+    restart_policy: "always"
+    nats:
+      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "transcriber"
+"#,
+        )
+        .expect_err("expected JobRestartPolicy error");
+
+        match err {
+            Error::JobRestartPolicy { name } => assert_eq!(name, "transcriber"),
+            other => panic!("expected JobRestartPolicy error, got {}", other),
+        }
+    }
+
+    #[test]
+    fn nats_with_cron_rejected() {
+        let err = load_yaml(
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://127.0.0.1:4222"
+scripts:
+  transcriber:
+    command: "echo job"
+    restart_policy: "never"
+    cron: "0 0 * * * * *"
+    nats:
+      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "transcriber"
+"#,
+        )
+        .expect_err("expected ConflictingTriggers error");
+
+        match err {
+            Error::ConflictingTriggers { name } => assert_eq!(name, "transcriber"),
+            other => panic!("expected ConflictingTriggers error, got {}", other),
+        }
+    }
+
+    #[test]
+    fn nats_without_settings_nats_rejected() {
+        let err = load_yaml(
+            r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  transcriber:
+    command: "echo job"
+    restart_policy: "never"
+    nats:
+      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "transcriber"
+"#,
+        )
+        .expect_err("expected NatsUrlMissing error");
+
+        match err {
+            Error::NatsUrlMissing { name } => assert_eq!(name, "transcriber"),
+            other => panic!("expected NatsUrlMissing error, got {}", other),
+        }
+    }
+
+    #[test]
+    fn config_without_nats_loads_unchanged() {
+        let config = load_yaml(
+            r#"
+settings:
+  log_dir: "./logs"
+scripts:
+  worker:
+    command: "echo worker"
+    restart_policy: "always"
+  nightly:
+    command: "echo nightly"
+    restart_policy: "never"
+    cron: "0 0 3 * * * *"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.settings.nats.is_none());
+        assert!(config.scripts["worker"].nats.is_none());
+        assert_eq!(
+            config.scripts["worker"].restart_policy,
+            RestartPolicy::Always
+        );
+        assert_eq!(
+            config.scripts["nightly"].cron.as_deref(),
+            Some("0 0 3 * * * *")
+        );
     }
 
     #[test]

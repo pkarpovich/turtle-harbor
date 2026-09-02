@@ -22,7 +22,36 @@ impl ConfigManager {
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
         let config = Config::load(path)?;
+        self.check_durables(path, &config)?;
         self.configs.insert(path.to_path_buf(), config);
+        Ok(())
+    }
+
+    fn check_durables(&self, config_path: &Path, config: &Config) -> Result<()> {
+        let mut owners: HashMap<(&str, &str), &Path> = HashMap::new();
+        for (path, loaded) in &self.configs {
+            if path.as_path() == config_path {
+                continue;
+            }
+            for script in loaded.scripts.values() {
+                let Some(nats) = &script.nats else { continue };
+                owners.insert((&nats.stream, &nats.durable), path.as_path());
+            }
+        }
+
+        for script in config.scripts.values() {
+            let Some(nats) = &script.nats else { continue };
+            let key = (nats.stream.as_str(), nats.durable.as_str());
+            if let Some(owner) = owners.get(&key) {
+                return Err(Error::DuplicateDurable {
+                    stream: nats.stream.clone(),
+                    durable: nats.durable.clone(),
+                    path: owner.to_path_buf(),
+                });
+            }
+            owners.insert(key, config_path);
+        }
+
         Ok(())
     }
 
@@ -103,6 +132,8 @@ impl ConfigManager {
                 });
             }
         }
+
+        self.check_durables(config_path, &new_config)?;
 
         self.configs.insert(config_path.to_path_buf(), new_config);
 
@@ -313,6 +344,102 @@ scripts:
 
         assert!(mgr.has_script(file_b.path(), "script_b1"));
         assert!(!mgr.has_script(file_b.path(), "script_a1"));
+    }
+
+    fn nats_config(script: &str, stream: &str, durable: &str) -> String {
+        format!(
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://127.0.0.1:4222"
+scripts:
+  {script}:
+    command: "echo job"
+    restart_policy: "never"
+    nats:
+      stream: "{stream}"
+      subject: "recordings.completed"
+      durable: "{durable}"
+"#
+        )
+    }
+
+    #[test]
+    fn load_rejects_same_durable_in_another_config() {
+        let file_a = write_config(&nats_config("job_a", "recordings", "shared"));
+        let file_b = write_config(&nats_config("job_b", "recordings", "shared"));
+        let mut mgr = ConfigManager::new();
+
+        mgr.load(file_a.path()).unwrap();
+        let err = mgr
+            .load(file_b.path())
+            .expect_err("expected DuplicateDurable error");
+
+        match err {
+            Error::DuplicateDurable {
+                stream,
+                durable,
+                path,
+            } => {
+                assert_eq!(stream, "recordings");
+                assert_eq!(durable, "shared");
+                assert_eq!(path, file_a.path());
+            }
+            other => panic!("expected DuplicateDurable error, got {}", other),
+        }
+
+        assert!(!mgr.has_script(file_b.path(), "job_b"));
+    }
+
+    #[test]
+    fn reload_rejects_same_durable_in_another_config() {
+        let file_a = write_config(&nats_config("job_a", "recordings", "shared"));
+        let file_b = write_config(&nats_config("job_b", "recordings", "other"));
+        let mut mgr = ConfigManager::new();
+
+        mgr.load(file_a.path()).unwrap();
+        mgr.load(file_b.path()).unwrap();
+
+        std::fs::write(
+            file_b.path(),
+            nats_config("job_b", "recordings", "shared").as_bytes(),
+        )
+        .unwrap();
+
+        let err = mgr
+            .reload(file_b.path())
+            .err()
+            .expect("expected DuplicateDurable error");
+
+        match err {
+            Error::DuplicateDurable {
+                stream,
+                durable,
+                path,
+            } => {
+                assert_eq!(stream, "recordings");
+                assert_eq!(durable, "shared");
+                assert_eq!(path, file_a.path());
+            }
+            other => panic!("expected DuplicateDurable error, got {}", other),
+        }
+
+        let script = mgr.script(file_b.path(), "job_b").unwrap();
+        assert_eq!(script.nats.as_ref().unwrap().durable, "other");
+    }
+
+    #[test]
+    fn same_durable_on_different_streams_accepted() {
+        let file_a = write_config(&nats_config("job_a", "recordings", "shared"));
+        let file_b = write_config(&nats_config("job_b", "meetings", "shared"));
+        let mut mgr = ConfigManager::new();
+
+        mgr.load(file_a.path()).unwrap();
+        mgr.load(file_b.path()).unwrap();
+
+        assert!(mgr.has_script(file_a.path(), "job_a"));
+        assert!(mgr.has_script(file_b.path(), "job_b"));
     }
 
     #[test]

@@ -278,15 +278,15 @@ A new variant, persisted in `state.json`. `th ps` renders it as `listening` (dim
 - Modify: `src/client/error.rs`
 - Modify: `src/daemon/config_manager.rs`
 
-- [ ] add `NatsSettings` and `Settings.nats: Option<NatsSettings>` with `#[serde(default)]`
-- [ ] add `NatsTrigger` with the eight fields from Technical Details, durations via `#[serde(with = "humantime_serde")]`, defaults through `#[serde(default = "...")]` functions, and `Script.nats: Option<NatsTrigger>` with `#[serde(default)]`
-- [ ] add `Error::JobRestartPolicy { name }`, `Error::ConflictingTriggers { name }`, `Error::NatsUrlMissing { name }`, `Error::DuplicateDurable { stream, durable, path }`, and a `handle_error` arm for each in `src/client/error.rs`
-- [ ] add `Config::validate(&self) -> Result<()>` called at the end of `Config::load`, checking the three per-file rules in order per script
-- [ ] add the cross-config `(stream, durable)` uniqueness check to `ConfigManager::load` and `ConfigManager::reload`, next to the existing `DuplicateScript` check
-- [ ] update the `make_script_with_env_file` test helper for the new field
-- [ ] write tests in `config.rs`: a full `nats` block parses with humantime durations and `publish`; omitted optional fields take the documented defaults; each of the three validation rules yields its error; a config without any `nats` still loads unchanged
-- [ ] write tests in `config_manager.rs`: two scripts sharing `(stream, durable)` across two configs are rejected on `load` and on `reload`; the same durable on different streams is accepted
-- [ ] run `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` - must pass before Task 3
+- [x] add `NatsSettings` and `Settings.nats: Option<NatsSettings>` with `#[serde(default)]`
+- [x] add `NatsTrigger` with the eight fields from Technical Details, durations via `#[serde(with = "humantime_serde")]`, defaults through `#[serde(default = "...")]` functions, and `Script.nats: Option<NatsTrigger>` with `#[serde(default)]`
+- [x] add `Error::JobRestartPolicy { name }`, `Error::ConflictingTriggers { name }`, `Error::NatsUrlMissing { name }`, `Error::DuplicateDurable { stream, durable, path }`, and a `handle_error` arm for each in `src/client/error.rs`
+- [x] add `Config::validate(&self) -> Result<()>` called at the end of `Config::load`, checking the three per-file rules in order per script
+- [x] add the cross-config `(stream, durable)` uniqueness check to `ConfigManager::load` and `ConfigManager::reload`, next to the existing `DuplicateScript` check
+- [x] update the `make_script_with_env_file` test helper for the new field
+- [x] write tests in `config.rs`: a full `nats` block parses with humantime durations and `publish`; omitted optional fields take the documented defaults; each of the three validation rules yields its error; a config without any `nats` still loads unchanged
+- [x] write tests in `config_manager.rs`: two scripts sharing `(stream, durable)` across two configs are rejected on `load` and on `reload`; the same durable on different streams is accepted
+- [x] run `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` - must pass before Task 3
 
 ### Task 3: `ProcessStatus::Listening` in IPC, state and `th ps`
 
