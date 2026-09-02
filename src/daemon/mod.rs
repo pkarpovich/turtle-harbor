@@ -3,6 +3,7 @@ mod cron_manager;
 mod daemon_core;
 pub mod health;
 mod http_server;
+pub mod job;
 mod log_monitor;
 mod loki_shipper;
 mod process;

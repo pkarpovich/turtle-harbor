@@ -308,13 +308,13 @@ A new variant, persisted in `state.json`. `th ps` renders it as `listening` (dim
 - Create: `src/daemon/job.rs`
 - Modify: `src/daemon/mod.rs`
 
-- [ ] define `JobOutcome { Exited(i32), Signaled, TimedOut, NotStarted, ReplyLost, PublishFailed }`, `Verdict { Ack, Nak, Term }`, `Delivery { delivered: u32, max_deliver: u32 }`
-- [ ] define `pub fn verdict(outcome: JobOutcome, delivery: Delivery) -> Verdict` implementing the Outcomes and verdicts table: `Exited(0)` -> `Ack`; `Exited(65)` -> `Term`; `Exited(other)`/`Signaled`/`TimedOut`/`PublishFailed` -> `Nak` while `delivered < max_deliver`, else `Term`; `NotStarted`/`ReplyLost` -> `Nak` always
-- [ ] define `JobInput { payload: String, subject: String, delivery: Delivery, traceparent: Option<String>, result_path: Option<PathBuf> }` and `pub fn job_env(input: &JobInput) -> HashMap<OsString, OsString>` producing exactly the six variables from Technical Details
-- [ ] define `pub const EXIT_UNPROCESSABLE: i32 = 65`
-- [ ] write table-driven tests for `verdict` covering every `JobOutcome` at `delivered < max_deliver` and at `delivered == max_deliver`: the bounded outcomes flip to `Term` at the boundary, `Exited(0)` stays `Ack`, `Exited(65)` stays `Term`, `NotStarted` and `ReplyLost` stay `Nak`
-- [ ] write tests for `job_env`: all six variables present when everything is set; `TRACEPARENT` and `TH_JOB_RESULT` absent when `None`
-- [ ] run `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` - must pass before Task 5
+- [x] define `JobOutcome { Exited(i32), Signaled, TimedOut, NotStarted, ReplyLost, PublishFailed }`, `Verdict { Ack, Nak, Term }`, `Delivery { delivered: u32, max_deliver: u32 }`
+- [x] define `pub fn verdict(outcome: JobOutcome, delivery: Delivery) -> Verdict` implementing the Outcomes and verdicts table: `Exited(0)` -> `Ack`; `Exited(65)` -> `Term`; `Exited(other)`/`Signaled`/`TimedOut`/`PublishFailed` -> `Nak` while `delivered < max_deliver`, else `Term`; `NotStarted`/`ReplyLost` -> `Nak` always
+- [x] define `JobInput { payload: String, subject: String, delivery: Delivery, traceparent: Option<String>, result_path: Option<PathBuf> }` and `pub fn job_env(input: &JobInput) -> HashMap<OsString, OsString>` producing exactly the six variables from Technical Details
+- [x] define `pub const EXIT_UNPROCESSABLE: i32 = 65`
+- [x] write table-driven tests for `verdict` covering every `JobOutcome` at `delivered < max_deliver` and at `delivered == max_deliver`: the bounded outcomes flip to `Term` at the boundary, `Exited(0)` stays `Ack`, `Exited(65)` stays `Term`, `NotStarted` and `ReplyLost` stay `Nak`
+- [x] write tests for `job_env`: all six variables present when everything is set; `TRACEPARENT` and `TH_JOB_RESULT` absent when `None`
+- [x] run `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` - must pass before Task 5
 
 ### Task 5: `ProcessSupervisor::start_script` takes an options struct with extra env
 
