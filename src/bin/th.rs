@@ -1,10 +1,10 @@
-use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
+use std::path::PathBuf;
 use std::time::Duration;
-use turtle_harbor::client::{commands, service, updater};
 use turtle_harbor::client::error::handle_error;
+use turtle_harbor::client::{commands, service, updater};
 use turtle_harbor::common::error::Error;
 use turtle_harbor::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
 
@@ -19,8 +19,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    Up { script_name: Option<String> },
-    Down { script_name: Option<String> },
+    Up {
+        script_name: Option<String>,
+    },
+    Down {
+        script_name: Option<String>,
+    },
     Ps,
     List,
     Logs {
@@ -164,7 +168,11 @@ async fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::Up { script_name } => {
-            let response = commands::send_command(Command::Up { name: script_name, config_path }).await?;
+            let response = commands::send_command(Command::Up {
+                name: script_name,
+                config_path,
+            })
+            .await?;
             match response {
                 Response::Success => println!("Scripts started successfully"),
                 Response::Error(e) => eprintln!("Error: {}", e),
@@ -172,7 +180,11 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Down { script_name } => {
-            let response = commands::send_command(Command::Down { name: script_name, config_path }).await?;
+            let response = commands::send_command(Command::Down {
+                name: script_name,
+                config_path,
+            })
+            .await?;
             match response {
                 Response::Success => println!("Scripts stopped successfully"),
                 Response::Error(e) => eprintln!("Error: {}", e),
@@ -180,7 +192,10 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Ps => {
-            let response = commands::send_command(Command::Ps { config_path: Some(config_path) }).await?;
+            let response = commands::send_command(Command::Ps {
+                config_path: Some(config_path),
+            })
+            .await?;
             match response {
                 Response::ProcessList(processes) => print_process_list_table(&processes),
                 Response::Error(e) => eprintln!("Error retrieving process list: {}", e),
@@ -190,7 +205,9 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::List => {
             let response = commands::send_command(Command::Ps { config_path: None }).await?;
             match response {
-                Response::ProcessList(processes) => print_process_list_table_with_config(&processes),
+                Response::ProcessList(processes) => {
+                    print_process_list_table_with_config(&processes)
+                }
                 Response::Error(e) => eprintln!("Error retrieving process list: {}", e),
                 _ => eprintln!("Unexpected response for list command"),
             }

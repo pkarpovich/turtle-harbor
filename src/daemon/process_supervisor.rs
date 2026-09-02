@@ -45,7 +45,13 @@ impl ProcessSupervisor {
         &self.log_dir
     }
 
-    pub fn start_script(&mut self, name: &str, script_def: &Script, broadcast_tx: broadcast::Sender<String>, config_dir: &Path) -> Result<ScriptStartResult> {
+    pub fn start_script(
+        &mut self,
+        name: &str,
+        script_def: &Script,
+        broadcast_tx: broadcast::Sender<String>,
+        config_dir: &Path,
+    ) -> Result<ScriptStartResult> {
         tracing::info!(
             script = %name,
             command = %script_def.command,
@@ -66,7 +72,12 @@ impl ProcessSupervisor {
 
         let log_path = log_monitor::get_log_path(&self.log_dir, name);
         log_monitor::ensure_log_dir(&self.log_dir)?;
-        let logger = ScriptLogger::new(log_path, broadcast_tx, name.to_string(), self.loki_tx.clone())?;
+        let logger = ScriptLogger::new(
+            log_path,
+            broadcast_tx,
+            name.to_string(),
+            self.loki_tx.clone(),
+        )?;
 
         let mut cmd = TokioCommand::new("sh");
         cmd.arg("-c")
@@ -90,10 +101,10 @@ impl ProcessSupervisor {
         // async-signal-safe per POSIX and only affects the child process
         let mut child = unsafe {
             cmd.pre_exec(|| {
-                    libc::setpgid(0, 0);
-                    Ok(())
-                })
-                .spawn()?
+                libc::setpgid(0, 0);
+                Ok(())
+            })
+            .spawn()?
         };
 
         let pid = child.id().unwrap_or(0);
@@ -147,7 +158,9 @@ impl ProcessSupervisor {
 
                 if let Some(mut watcher) = process.watcher.take() {
                     match tokio::time::timeout(Duration::from_secs(5), &mut watcher).await {
-                        Ok(_) => tracing::debug!(script = %name, "Process group exited after SIGTERM"),
+                        Ok(_) => {
+                            tracing::debug!(script = %name, "Process group exited after SIGTERM")
+                        }
                         Err(_) => {
                             tracing::warn!(script = %name, "SIGTERM timeout, sending SIGKILL to process group");
                             // SAFETY: same pgid, escalating to SIGKILL after SIGTERM timeout

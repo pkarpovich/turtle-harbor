@@ -31,10 +31,7 @@ fn plist_path() -> PathBuf {
 #[cfg(target_os = "macos")]
 fn generate_plist(turtled: &std::path::Path, http_port: Option<u16>) -> String {
     let log_dir = crate::common::paths::log_dir();
-    let mut args = format!(
-        "        <string>{}</string>",
-        turtled.display()
-    );
+    let mut args = format!("        <string>{}</string>", turtled.display());
     if let Some(port) = http_port {
         args.push_str(&format!(
             "\n        <string>--http-port</string>\n        <string>{}</string>",
@@ -140,7 +137,11 @@ fn install_platform(turtled: &std::path::Path, http_port: Option<u16>) -> anyhow
     if already_loaded {
         println!("Stopping existing service...");
         let _ = Command::new("launchctl")
-            .args(["bootout", &format!("gui/{}", current_uid()), plist.to_str().unwrap()])
+            .args([
+                "bootout",
+                &format!("gui/{}", current_uid()),
+                plist.to_str().unwrap(),
+            ])
             .status();
     }
 
@@ -157,7 +158,11 @@ fn install_platform(turtled: &std::path::Path, http_port: Option<u16>) -> anyhow
     println!("Wrote {}", plist.display());
 
     let status = Command::new("launchctl")
-        .args(["bootstrap", &format!("gui/{}", current_uid()), plist.to_str().unwrap()])
+        .args([
+            "bootstrap",
+            &format!("gui/{}", current_uid()),
+            plist.to_str().unwrap(),
+        ])
         .status()?;
 
     if !status.success() {
@@ -166,7 +171,10 @@ fn install_platform(turtled: &std::path::Path, http_port: Option<u16>) -> anyhow
 
     println!("Service installed and started.");
     println!("  Full Disk Access (grant once): {}", stable.display());
-    println!("  Stop:      launchctl bootout gui/$(id -u) {}", plist.display());
+    println!(
+        "  Stop:      launchctl bootout gui/$(id -u) {}",
+        plist.display()
+    );
     println!("  Uninstall: th uninstall");
     Ok(())
 }
@@ -214,7 +222,11 @@ fn uninstall_platform() -> anyhow::Result<()> {
     }
 
     let _ = Command::new("launchctl")
-        .args(["bootout", &format!("gui/{}", current_uid()), plist.to_str().unwrap()])
+        .args([
+            "bootout",
+            &format!("gui/{}", current_uid()),
+            plist.to_str().unwrap(),
+        ])
         .status();
 
     std::fs::remove_file(&plist)?;

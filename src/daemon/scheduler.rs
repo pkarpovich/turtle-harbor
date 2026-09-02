@@ -25,17 +25,12 @@ pub fn spawn_cron_task(
 
             let now = Local::now();
             if next > now {
-                let duration = next
-                    .signed_duration_since(now)
-                    .to_std()
-                    .unwrap_or_default();
+                let duration = next.signed_duration_since(now).to_std().unwrap_or_default();
                 tokio::time::sleep(duration).await;
             }
 
             if event_tx
-                .send(DaemonEvent::CronTick {
-                    name: name.clone(),
-                })
+                .send(DaemonEvent::CronTick { name: name.clone() })
                 .await
                 .is_err()
             {

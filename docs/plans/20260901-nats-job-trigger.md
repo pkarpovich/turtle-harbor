@@ -265,9 +265,9 @@ A new variant, persisted in `state.json`. `th ps` renders it as `listening` (dim
 **Files:**
 - Modify: every file `cargo fmt` rewrites (12 at HEAD, formatting only)
 
-- [ ] run `cargo fmt` and confirm `cargo fmt --check` is clean
-- [ ] confirm `git diff --stat` touches formatting only: `cargo test` still 43 green, `cargo clippy --all-targets -- -D warnings` still clean, no logic change
-- [ ] commit this as a standalone formatting change before any feature work, so every later task's diff shows only that task
+- [x] run `cargo fmt` and confirm `cargo fmt --check` is clean
+- [x] confirm `git diff --stat` touches formatting only: `cargo test` still 43 green, `cargo clippy --all-targets -- -D warnings` still clean, no logic change
+- [x] commit this as a standalone formatting change before any feature work, so every later task's diff shows only that task
 
 ### Task 2: Config types for `settings.nats` and `script.nats` with validation
 

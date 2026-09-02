@@ -90,17 +90,13 @@ impl ConfigManager {
         let new_config = Config::load(config_path)?;
 
         for name in new_config.scripts.keys() {
-            if let Some(existing) = self
-                .configs
-                .iter()
-                .find_map(|(path, config)| {
-                    if path.as_path() != config_path && config.scripts.contains_key(name) {
-                        Some(path.clone())
-                    } else {
-                        None
-                    }
-                })
-            {
+            if let Some(existing) = self.configs.iter().find_map(|(path, config)| {
+                if path.as_path() != config_path && config.scripts.contains_key(name) {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            }) {
                 return Err(Error::DuplicateScript {
                     name: name.clone(),
                     path: existing,

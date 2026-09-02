@@ -25,10 +25,9 @@ pub fn handle_error(error: Error) -> ! {
             path.display()
         ),
         Error::ConfigNotLoaded => "No configuration loaded - run 'th up' first".to_string(),
-        Error::CronParse {
-            expression,
-            source,
-        } => format!("Invalid cron '{}': {}", expression, source),
+        Error::CronParse { expression, source } => {
+            format!("Invalid cron '{}': {}", expression, source)
+        }
         Error::Json(e) => format!("JSON error: {}", e),
     };
 

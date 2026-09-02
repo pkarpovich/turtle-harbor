@@ -41,7 +41,9 @@ pub enum DaemonEvent {
 
 fn backoff_delay(attempt: u32) -> Duration {
     let base_secs: u64 = 15;
-    let multiplier = 1u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX);
+    let multiplier = 1u64
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u64::MAX);
     let secs = base_secs.saturating_mul(multiplier).min(300);
     Duration::from_secs(secs)
 }
@@ -514,14 +516,16 @@ impl DaemonCore {
         }
     }
 
-    async fn start_scripts(
-        &mut self,
-        name: Option<String>,
-        config_path: &Path,
-    ) -> Result<()> {
+    async fn start_scripts(&mut self, name: Option<String>, config_path: &Path) -> Result<()> {
         let names: Vec<String> = match name {
             Some(name) => vec![name],
-            None => self.config.config(config_path)?.scripts.keys().cloned().collect(),
+            None => self
+                .config
+                .config(config_path)?
+                .scripts
+                .keys()
+                .cloned()
+                .collect(),
         };
 
         {
@@ -624,9 +628,7 @@ impl DaemonCore {
     async fn stop_script(&mut self, name: &str) -> Result<()> {
         tracing::info!(script = %name, "Stopping script");
 
-        if !self.supervisor.contains(name)
-            && !self.state.scripts.iter().any(|s| s.name == name)
-        {
+        if !self.supervisor.contains(name) && !self.state.scripts.iter().any(|s| s.name == name) {
             return Err(Error::ScriptNotFound {
                 name: name.to_string(),
             });
@@ -1228,17 +1230,11 @@ scripts:
         let cfg = write_config(CONFIG_WITH_FOO);
 
         core.state
-            .update_script(dummy_script_state(
-                "foo",
-                Some(cfg.path().to_path_buf()),
-            ))
+            .update_script(dummy_script_state("foo", Some(cfg.path().to_path_buf())))
             .await
             .unwrap();
         core.state
-            .update_script(dummy_script_state(
-                "ghost",
-                Some(cfg.path().to_path_buf()),
-            ))
+            .update_script(dummy_script_state("ghost", Some(cfg.path().to_path_buf())))
             .await
             .unwrap();
 
@@ -1258,10 +1254,7 @@ scripts:
         let cfg_b = write_config(CONFIG_WITH_BAR_AND_KEEPER);
 
         core.state
-            .update_script(dummy_script_state(
-                "foo",
-                Some(cfg_a.path().to_path_buf()),
-            ))
+            .update_script(dummy_script_state("foo", Some(cfg_a.path().to_path_buf())))
             .await
             .unwrap();
         core.state
@@ -1272,10 +1265,7 @@ scripts:
             .await
             .unwrap();
         core.state
-            .update_script(dummy_script_state(
-                "bar",
-                Some(cfg_a.path().to_path_buf()),
-            ))
+            .update_script(dummy_script_state("bar", Some(cfg_a.path().to_path_buf())))
             .await
             .unwrap();
 
@@ -1367,7 +1357,9 @@ scripts: {}
         core.stop_script("foo").await.unwrap();
 
         let snapshot = core.health.read().await;
-        let entry = snapshot.get("foo").expect("health entry must remain after explicit stop");
+        let entry = snapshot
+            .get("foo")
+            .expect("health entry must remain after explicit stop");
         assert!(entry.healthy, "explicit stop should mark script healthy");
         assert!(matches!(entry.state, ScriptHealthState::Succeeded));
         assert_eq!(entry.pid, None, "stale pid must be cleared");

@@ -5,11 +5,11 @@ use tracing_appender::rolling;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub fn init_logging(log_dir: &Path) -> WorkerGuard {
-    let console_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("turtle_harbor=info"));
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("turtle_harbor=info"));
 
-    let file_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("turtle_harbor=debug"));
+    let file_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("turtle_harbor=debug"));
 
     let console_layer = fmt::layer()
         .with_writer(std::io::stdout)

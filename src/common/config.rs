@@ -1,8 +1,8 @@
 use crate::common::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_MAX_RESTARTS: u32 = 5;
 const DEFAULT_MAX_RESTARTS_CRON: u32 = 3;
@@ -65,7 +65,9 @@ impl Script {
 
     pub fn resolved_env(&self, config_dir: &Path) -> HashMap<OsString, OsString> {
         let mut env_vars: HashMap<OsString, OsString> = HashMap::new();
-        let base_dir = self.resolved_context(config_dir).unwrap_or_else(|| config_dir.to_path_buf());
+        let base_dir = self
+            .resolved_context(config_dir)
+            .unwrap_or_else(|| config_dir.to_path_buf());
 
         if let Some(env_file) = &self.env_file {
             let env_file_path = if env_file.is_absolute() {
@@ -130,13 +132,22 @@ fn parse_env_file(path: &Path) -> HashMap<String, String> {
         }
 
         let Some(eq_pos) = trimmed.find('=') else {
-            tracing::warn!("env file {}: skipping malformed line {}: {}", path.display(), line_num + 1, trimmed);
+            tracing::warn!(
+                "env file {}: skipping malformed line {}: {}",
+                path.display(),
+                line_num + 1,
+                trimmed
+            );
             continue;
         };
 
         let key = trimmed[..eq_pos].trim();
         if key.is_empty() {
-            tracing::warn!("env file {}: skipping line {} with empty key", path.display(), line_num + 1);
+            tracing::warn!(
+                "env file {}: skipping line {} with empty key",
+                path.display(),
+                line_num + 1
+            );
             continue;
         }
 
@@ -257,7 +268,10 @@ mod tests {
         assert_eq!(vars.get("KEY").unwrap(), "value");
     }
 
-    fn make_script_with_env_file(env_file: Option<PathBuf>, env: Option<HashMap<String, String>>) -> Script {
+    fn make_script_with_env_file(
+        env_file: Option<PathBuf>,
+        env: Option<HashMap<String, String>>,
+    ) -> Script {
         Script {
             command: "echo hello".to_string(),
             restart_policy: RestartPolicy::Never,
@@ -291,7 +305,10 @@ mod tests {
 
         assert_eq!(env.get(&OsString::from("SHARED")).unwrap(), "from_inline");
         assert_eq!(env.get(&OsString::from("FILE_ONLY")).unwrap(), "file_val");
-        assert_eq!(env.get(&OsString::from("INLINE_ONLY")).unwrap(), "inline_val");
+        assert_eq!(
+            env.get(&OsString::from("INLINE_ONLY")).unwrap(),
+            "inline_val"
+        );
     }
 
     #[test]
