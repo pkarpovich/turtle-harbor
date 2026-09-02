@@ -51,6 +51,14 @@ pub fn handle_error(error: Error) -> ! {
             stream,
             path.display()
         ),
+        Error::JobResultMissing { path } => {
+            format!("Job result file {} is missing", path.display())
+        }
+        Error::JobResultInvalid { path, source } => format!(
+            "Job result file {} is not valid JSON: {}",
+            path.display(),
+            source
+        ),
     };
 
     eprintln!("{}", message);

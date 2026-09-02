@@ -54,6 +54,15 @@ pub enum Error {
         durable: String,
         path: PathBuf,
     },
+
+    #[error("job result file {path} is missing or unreadable")]
+    JobResultMissing { path: PathBuf },
+
+    #[error("job result file {path} is not valid JSON: {source}")]
+    JobResultInvalid {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
