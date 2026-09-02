@@ -1,20 +1,73 @@
 use crate::common::config::NatsTrigger;
 use crate::common::error::{Error, Result};
+use crate::common::paths;
 use crate::daemon::daemon_core::DaemonEvent;
+use crate::daemon::job::{self, Delivery, JobInput, JobOutcome, Verdict};
 use async_nats::header::HeaderMap;
-use async_nats::jetstream::consumer::{pull, AckPolicy, DeliverPolicy};
+use async_nats::jetstream::consumer::{pull, AckPolicy, Consumer, DeliverPolicy};
+use async_nats::jetstream::{self, AckKind, Context, Message};
+use async_nats::ConnectOptions;
+use futures_util::StreamExt;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 const TRACEPARENT_HEADER: &str = "traceparent";
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+const RETRY_DELAY: Duration = Duration::from_secs(30);
+const BATCH_EXPIRES: Duration = Duration::from_secs(60);
+const BATCH_HEARTBEAT: Duration = Duration::from_secs(20);
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const TIMEOUT_GRACE: Duration = Duration::from_secs(10);
 
 pub struct Listener {
     handle: JoinHandle<()>,
     shutdown: watch::Sender<bool>,
+}
+
+#[derive(Clone)]
+struct ListenerConfig {
+    name: String,
+    trigger: NatsTrigger,
+    url: String,
+    event_tx: mpsc::Sender<DaemonEvent>,
+}
+
+enum SessionExit {
+    Shutdown,
+    Failed(String),
+}
+
+enum AfterMessage {
+    Continue,
+    Stop(SessionExit),
+}
+
+enum JobResolution {
+    Outcome(JobOutcome),
+    Shutdown,
+}
+
+enum PublishFailure {
+    Contract(String),
+    Transient(String),
+}
+
+struct Attempt {
+    subject: String,
+    stream_sequence: u64,
+    delivery: Delivery,
+    traceparent: Option<String>,
+    result_path: Option<PathBuf>,
+}
+
+struct Session {
+    config: ListenerConfig,
+    context: Context,
+    consumer: Consumer<pull::Config>,
+    max_deliver: u32,
 }
 
 pub struct NatsManager {
@@ -33,28 +86,18 @@ impl NatsManager {
     pub async fn listen(&mut self, name: &str, trigger: &NatsTrigger, url: &str) {
         self.cancel(name).await;
 
-        let (shutdown, mut shutdown_rx) = watch::channel(false);
-        let name = name.to_string();
-        let subject = trigger.subject.clone();
-        let url = url.to_string();
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let config = ListenerConfig {
+            name: name.to_string(),
+            trigger: trigger.clone(),
+            url: url.to_string(),
+            event_tx: self.event_tx.clone(),
+        };
 
-        let task_name = name.clone();
-        let handle = tokio::spawn(async move {
-            tracing::debug!(script = %task_name, url = %url, subject = %subject, "Listener started");
-            loop {
-                let stop = *shutdown_rx.borrow_and_update();
-                if stop {
-                    break;
-                }
-                let Ok(()) = shutdown_rx.changed().await else {
-                    break;
-                };
-            }
-            tracing::debug!(script = %task_name, "Listener stopped");
-        });
+        let handle = tokio::spawn(run_listener(config, shutdown_rx));
 
         self.tasks
-            .insert(name.clone(), Listener { handle, shutdown });
+            .insert(name.to_string(), Listener { handle, shutdown });
         tracing::info!(script = %name, "Listener registered");
     }
 
@@ -140,6 +183,432 @@ pub fn publish_headers(traceparent: Option<&str>) -> HeaderMap {
         headers.insert(TRACEPARENT_HEADER, traceparent);
     }
     headers
+}
+
+pub fn delivered_count(delivered: i64) -> u32 {
+    if delivered <= 0 {
+        return 1;
+    }
+    u32::try_from(delivered).unwrap_or(u32::MAX)
+}
+
+pub fn server_max_deliver(max_deliver: i64) -> u32 {
+    if max_deliver <= 0 {
+        return u32::MAX;
+    }
+    u32::try_from(max_deliver).unwrap_or(u32::MAX)
+}
+
+async fn run_listener(config: ListenerConfig, shutdown: watch::Receiver<bool>) {
+    tracing::debug!(script = %config.name, url = %config.url, subject = %config.trigger.subject, "Listener started");
+
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
+        let mut session_shutdown = shutdown.clone();
+        match run_session(&config, &mut session_shutdown).await {
+            SessionExit::Shutdown => break,
+            SessionExit::Failed(error) => {
+                tracing::warn!(script = %config.name, %error, "NATS listener failed, retrying");
+                let sent = config
+                    .event_tx
+                    .send(DaemonEvent::ListenerFailed {
+                        name: config.name.clone(),
+                        error,
+                    })
+                    .await;
+                let Ok(()) = sent else {
+                    break;
+                };
+            }
+        }
+
+        let mut delay_shutdown = shutdown.clone();
+        tokio::select! {
+            biased;
+            _ = delay_shutdown.changed() => break,
+            _ = tokio::time::sleep(RETRY_DELAY) => {}
+        }
+    }
+
+    tracing::debug!(script = %config.name, "Listener stopped");
+}
+
+async fn run_session(config: &ListenerConfig, shutdown: &mut watch::Receiver<bool>) -> SessionExit {
+    let bound = tokio::select! {
+        biased;
+        _ = shutdown.changed() => return SessionExit::Shutdown,
+        bound = bind(config) => bound,
+    };
+
+    let session = match bound {
+        Ok(session) => session,
+        Err(error) => return SessionExit::Failed(error),
+    };
+
+    let sent = config
+        .event_tx
+        .send(DaemonEvent::ListenerReady {
+            name: config.name.clone(),
+        })
+        .await;
+    let Ok(()) = sent else {
+        return SessionExit::Shutdown;
+    };
+
+    loop {
+        let message = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return SessionExit::Shutdown,
+            message = session.next_message() => message,
+        };
+
+        let message = match message {
+            Ok(Some(message)) => message,
+            Ok(None) => continue,
+            Err(error) => return SessionExit::Failed(error),
+        };
+
+        match session.handle_message(message, shutdown).await {
+            AfterMessage::Continue => {}
+            AfterMessage::Stop(exit) => return exit,
+        }
+    }
+}
+
+async fn bind(config: &ListenerConfig) -> std::result::Result<Session, String> {
+    let ListenerConfig {
+        name,
+        trigger,
+        url,
+        event_tx: _,
+    } = config;
+
+    let client = ConnectOptions::new()
+        .retry_on_initial_connect()
+        .connect(url.as_str())
+        .await;
+    let client = match client {
+        Ok(client) => client,
+        Err(e) => return Err(format!("connect to {url}: {e}")),
+    };
+
+    let context = jetstream::new(client);
+    let stream = match context.get_stream(&trigger.stream).await {
+        Ok(stream) => stream,
+        Err(e) => return Err(format!("stream '{}': {e}", trigger.stream)),
+    };
+
+    let consumer = stream
+        .get_or_create_consumer(&trigger.durable, consumer_config(trigger))
+        .await;
+    let consumer = match consumer {
+        Ok(consumer) => consumer,
+        Err(e) => return Err(format!("consumer '{}': {e}", trigger.durable)),
+    };
+
+    let server = &consumer.cached_info().config;
+    let max_deliver = server_max_deliver(server.max_deliver);
+    if max_deliver != trigger.max_deliver || server.ack_wait != trigger.ack_wait {
+        tracing::warn!(
+            script = %name,
+            server_max_deliver = max_deliver,
+            config_max_deliver = trigger.max_deliver,
+            server_ack_wait = ?server.ack_wait,
+            config_ack_wait = ?trigger.ack_wait,
+            "Durable exists with different settings - server values apply"
+        );
+    }
+
+    Ok(Session {
+        config: config.clone(),
+        context,
+        consumer,
+        max_deliver,
+    })
+}
+
+impl Session {
+    async fn next_message(&self) -> std::result::Result<Option<Message>, String> {
+        let batch = self
+            .consumer
+            .batch()
+            .max_messages(1)
+            .expires(BATCH_EXPIRES)
+            .heartbeat(BATCH_HEARTBEAT)
+            .messages()
+            .await;
+
+        let mut batch = match batch {
+            Ok(batch) => batch,
+            Err(e) => return Err(format!("pull request: {e}")),
+        };
+
+        match batch.next().await {
+            None => Ok(None),
+            Some(Ok(message)) => Ok(Some(message)),
+            Some(Err(e)) => Err(format!("fetch: {e}")),
+        }
+    }
+
+    async fn handle_message(
+        &self,
+        message: Message,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> AfterMessage {
+        let name = self.config.name.as_str();
+        let subject = message.subject.to_string();
+
+        let Ok(info) = message.info() else {
+            tracing::error!(script = %name, %subject, "Message carries no JetStream metadata");
+            self.settle(&message, Verdict::Nak).await;
+            return AfterMessage::Continue;
+        };
+        let delivery = Delivery {
+            delivered: delivered_count(info.delivered),
+            max_deliver: self.max_deliver,
+        };
+        let stream_sequence = info.stream_sequence;
+
+        let Ok(payload) = String::from_utf8(message.payload.to_vec()) else {
+            tracing::error!(script = %name, %subject, stream_sequence, "Payload is not UTF-8, terminating message");
+            self.settle(&message, Verdict::Term).await;
+            return AfterMessage::Continue;
+        };
+
+        let attempt = Attempt {
+            subject,
+            stream_sequence,
+            delivery,
+            traceparent: traceparent(message.headers.as_ref()),
+            result_path: self.prepare_result_file(),
+        };
+
+        let env = job::job_env(&JobInput {
+            payload,
+            subject: attempt.subject.clone(),
+            delivery,
+            traceparent: attempt.traceparent.clone(),
+            result_path: attempt.result_path.clone(),
+        });
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let sent = self
+            .config
+            .event_tx
+            .send(DaemonEvent::JobTrigger {
+                name: self.config.name.clone(),
+                env,
+                reply_tx,
+            })
+            .await;
+        let Ok(()) = sent else {
+            self.remove_result_file(&attempt);
+            return AfterMessage::Stop(SessionExit::Shutdown);
+        };
+
+        let outcome = match self.await_outcome(&message, reply_rx, shutdown).await {
+            JobResolution::Outcome(outcome) => outcome,
+            JobResolution::Shutdown => {
+                let nak = message
+                    .double_ack_with(AckKind::Nak(Some(Duration::ZERO)))
+                    .await;
+                if let Err(e) = nak {
+                    tracing::error!(script = %name, error = %e, "Failed to nak in-flight message on shutdown");
+                }
+                self.remove_result_file(&attempt);
+                return AfterMessage::Stop(SessionExit::Shutdown);
+            }
+        };
+
+        let verdict = self.decide(&attempt, outcome.clone()).await;
+        self.settle(&message, verdict).await;
+        self.remove_result_file(&attempt);
+
+        tracing::info!(
+            script = %name,
+            subject = %attempt.subject,
+            stream_sequence = attempt.stream_sequence,
+            delivered = attempt.delivery.delivered,
+            ?outcome,
+            ?verdict,
+            "Job attempt settled"
+        );
+
+        AfterMessage::Continue
+    }
+
+    async fn await_outcome(
+        &self,
+        message: &Message,
+        reply_rx: oneshot::Receiver<JobOutcome>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> JobResolution {
+        let name = self.config.name.as_str();
+        let mut reply_rx = reply_rx;
+        let mut progress = tokio::time::interval_at(
+            tokio::time::Instant::now() + PROGRESS_INTERVAL,
+            PROGRESS_INTERVAL,
+        );
+        let timeout = tokio::time::sleep(self.config.trigger.job_timeout);
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                biased;
+                reply = &mut reply_rx => {
+                    return match reply {
+                        Ok(outcome) => JobResolution::Outcome(outcome),
+                        Err(e) => {
+                            tracing::error!(script = %name, error = %e, "Job reply channel closed without an outcome");
+                            JobResolution::Outcome(JobOutcome::ReplyLost)
+                        }
+                    };
+                }
+                _ = shutdown.changed() => return JobResolution::Shutdown,
+                _ = &mut timeout => {
+                    return self.resolve_timeout(reply_rx).await;
+                }
+                _ = progress.tick() => {
+                    if let Err(e) = message.ack_with(AckKind::Progress).await {
+                        tracing::warn!(script = %name, error = %e, "Failed to send job heartbeat");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn resolve_timeout(&self, reply_rx: oneshot::Receiver<JobOutcome>) -> JobResolution {
+        let name = self.config.name.as_str();
+        tracing::error!(script = %name, timeout_secs = self.config.trigger.job_timeout.as_secs(), "Job exceeded job_timeout");
+
+        let sent = self
+            .config
+            .event_tx
+            .send(DaemonEvent::JobTimeout {
+                name: self.config.name.clone(),
+            })
+            .await;
+        let Ok(()) = sent else {
+            return JobResolution::Outcome(JobOutcome::TimedOut);
+        };
+
+        match tokio::time::timeout(TIMEOUT_GRACE, reply_rx).await {
+            Ok(Ok(outcome)) => JobResolution::Outcome(outcome),
+            Ok(Err(_)) => JobResolution::Outcome(JobOutcome::TimedOut),
+            Err(_) => JobResolution::Outcome(JobOutcome::TimedOut),
+        }
+    }
+
+    async fn decide(&self, attempt: &Attempt, outcome: JobOutcome) -> Verdict {
+        let verdict = job::verdict(outcome, attempt.delivery);
+        match verdict {
+            Verdict::Nak => return Verdict::Nak,
+            Verdict::Term => return Verdict::Term,
+            Verdict::Ack => {}
+        }
+
+        let Some(subject) = self.config.trigger.publish.clone() else {
+            return Verdict::Ack;
+        };
+
+        match self.publish_result(&subject, attempt).await {
+            Ok(()) => Verdict::Ack,
+            Err(PublishFailure::Contract(reason)) => {
+                tracing::error!(
+                    script = %self.config.name,
+                    subject = %attempt.subject,
+                    stream_sequence = attempt.stream_sequence,
+                    %reason,
+                    "Job result file violates the contract, terminating message"
+                );
+                Verdict::Term
+            }
+            Err(PublishFailure::Transient(reason)) => {
+                tracing::error!(
+                    script = %self.config.name,
+                    publish_subject = %subject,
+                    stream_sequence = attempt.stream_sequence,
+                    %reason,
+                    "Failed to publish job result"
+                );
+                job::verdict(JobOutcome::PublishFailed, attempt.delivery)
+            }
+        }
+    }
+
+    async fn publish_result(
+        &self,
+        subject: &str,
+        attempt: &Attempt,
+    ) -> std::result::Result<(), PublishFailure> {
+        let Some(path) = &attempt.result_path else {
+            return Err(PublishFailure::Transient(
+                "result file was never created".to_string(),
+            ));
+        };
+
+        let payload = match read_result(path) {
+            Ok(payload) => payload,
+            Err(e) => return Err(PublishFailure::Contract(e.to_string())),
+        };
+
+        let headers = publish_headers(attempt.traceparent.as_deref());
+        let ack = self
+            .context
+            .publish_with_headers(subject.to_string(), headers, payload.into())
+            .await;
+        let ack = match ack {
+            Ok(ack) => ack,
+            Err(e) => return Err(PublishFailure::Transient(e.to_string())),
+        };
+
+        match ack.await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(PublishFailure::Transient(e.to_string())),
+        }
+    }
+
+    async fn settle(&self, message: &Message, verdict: Verdict) {
+        let kind = match verdict {
+            Verdict::Ack => AckKind::Ack,
+            Verdict::Nak => AckKind::Nak(Some(self.config.trigger.nak_delay)),
+            Verdict::Term => AckKind::Term,
+        };
+
+        if let Err(e) = message.ack_with(kind).await {
+            tracing::error!(script = %self.config.name, error = %e, ?verdict, "Failed to settle message");
+        }
+    }
+
+    fn prepare_result_file(&self) -> Option<PathBuf> {
+        self.config.trigger.publish.as_ref()?;
+
+        let dir = paths::jobs_dir();
+        if let Err(e) = paths::ensure_dir(&dir) {
+            tracing::error!(script = %self.config.name, error = %e, "Failed to create jobs directory");
+            return None;
+        }
+
+        let path = paths::result_path(&self.config.name);
+        if let Err(e) = std::fs::write(&path, b"") {
+            tracing::error!(script = %self.config.name, error = %e, "Failed to create job result file");
+            return None;
+        }
+
+        Some(path)
+    }
+
+    fn remove_result_file(&self, attempt: &Attempt) {
+        let Some(path) = &attempt.result_path else {
+            return;
+        };
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::debug!(script = %self.config.name, error = %e, "Job result file already gone");
+        }
+    }
 }
 
 pub fn read_result(path: &Path) -> Result<Vec<u8>> {
@@ -277,6 +746,23 @@ mod tests {
         let path = paths::result_path("x");
         assert!(path.ends_with("x.result.json"));
         assert_eq!(path.parent(), Some(paths::jobs_dir().as_path()));
+    }
+
+    #[test]
+    fn test_delivered_count_never_below_one() {
+        assert_eq!(delivered_count(0), 1);
+        assert_eq!(delivered_count(-3), 1);
+        assert_eq!(delivered_count(1), 1);
+        assert_eq!(delivered_count(7), 7);
+        assert_eq!(delivered_count(i64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn test_server_max_deliver_treats_non_positive_as_unlimited() {
+        assert_eq!(server_max_deliver(-1), u32::MAX);
+        assert_eq!(server_max_deliver(0), u32::MAX);
+        assert_eq!(server_max_deliver(7), 7);
+        assert_eq!(server_max_deliver(i64::MAX), u32::MAX);
     }
 
     #[tokio::test]

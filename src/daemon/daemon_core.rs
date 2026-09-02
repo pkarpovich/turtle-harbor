@@ -1,4 +1,4 @@
-use crate::common::config::RestartPolicy;
+use crate::common::config::{NatsTrigger, RestartPolicy};
 use crate::common::error::{Error, Result};
 use crate::common::ipc::{Command, ProcessInfo, ProcessStatus, Response};
 use crate::daemon::config_manager::ConfigManager;
@@ -7,6 +7,7 @@ use crate::daemon::health::{self, HealthSnapshot, ScriptHealth, ScriptHealthStat
 use crate::daemon::job::JobOutcome;
 use crate::daemon::log_monitor;
 use crate::daemon::loki_shipper::{self, LokiLogEntry, LokiShipper};
+use crate::daemon::nats_manager::NatsManager;
 use crate::daemon::process::ScriptStartResult;
 use crate::daemon::process_supervisor::{ProcessSupervisor, StartScript};
 use crate::daemon::state::{RunningState, ScriptState};
@@ -38,21 +39,17 @@ pub enum DaemonEvent {
     CronTick {
         name: String,
     },
-    #[allow(dead_code)]
     JobTrigger {
         name: String,
         env: HashMap<OsString, OsString>,
         reply_tx: oneshot::Sender<JobOutcome>,
     },
-    #[allow(dead_code)]
     JobTimeout {
         name: String,
     },
-    #[allow(dead_code)]
     ListenerReady {
         name: String,
     },
-    #[allow(dead_code)]
     ListenerFailed {
         name: String,
         error: String,
@@ -73,6 +70,7 @@ pub struct DaemonCore {
     supervisor: ProcessSupervisor,
     config: ConfigManager,
     cron: CronManager,
+    nats: NatsManager,
     state: RunningState,
     event_tx: mpsc::Sender<DaemonEvent>,
     event_rx: mpsc::Receiver<DaemonEvent>,
@@ -93,6 +91,7 @@ impl DaemonCore {
         let supervisor = ProcessSupervisor::new(event_tx.clone(), log_dir);
         let config = ConfigManager::new();
         let cron = CronManager::new(event_tx.clone());
+        let nats = NatsManager::new(event_tx.clone());
         let log_channels = Arc::new(Mutex::new(HashMap::new()));
         let health = health::new_health_snapshot();
 
@@ -100,6 +99,7 @@ impl DaemonCore {
             supervisor,
             config,
             cron,
+            nats,
             state,
             event_tx,
             event_rx,
@@ -574,6 +574,14 @@ impl DaemonCore {
         }
     }
 
+    async fn register_listener(&mut self, name: &str, config_path: &Path, trigger: &NatsTrigger) {
+        let Some(url) = self.config.nats_url(config_path) else {
+            tracing::error!(script = %name, "Cannot register listener - settings.nats.url is missing");
+            return;
+        };
+        self.nats.listen(name, trigger, &url).await;
+    }
+
     fn is_job(&self, name: &str) -> bool {
         let Some(config_path) = self.script_config_path(name) else {
             return false;
@@ -590,6 +598,12 @@ impl DaemonCore {
         env: HashMap<OsString, OsString>,
         reply_tx: oneshot::Sender<JobOutcome>,
     ) {
+        if !self.nats.is_listening(name) {
+            tracing::info!(script = %name, "Job trigger declined - listener not registered");
+            let _ = reply_tx.send(JobOutcome::NotStarted);
+            return;
+        }
+
         let explicitly_stopped = self
             .state
             .scripts
@@ -783,6 +797,27 @@ impl DaemonCore {
             })?
             .clone();
 
+        if let Some(trigger) = script_def.nats.clone() {
+            self.update_script_state_with_config(
+                name,
+                config_path,
+                ProcessStatus::Listening,
+                false,
+                None,
+            )
+            .await?;
+            {
+                let mut snapshot = self.health.write().await;
+                snapshot
+                    .entry(name.to_string())
+                    .or_insert_with(|| ScriptHealth::never_ran(name.to_string()));
+            }
+            if !self.nats.is_listening(name) {
+                self.register_listener(name, config_path, &trigger).await;
+            }
+            return Ok(ScriptStartResult::Started);
+        }
+
         let cron = script_def.cron.clone();
         let config_dir = self.config.config_dir(config_path);
         let broadcast_tx = self.register_log_channel(name);
@@ -843,11 +878,13 @@ impl DaemonCore {
             .expect("log_channels mutex poisoned")
             .remove(name);
         self.cron.cancel(name);
+        self.nats.cancel(name).await;
         tracing::info!(script = %name, "Script stopped successfully");
         Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<()> {
+        self.nats.cancel_all().await;
         self.supervisor.shutdown_all().await;
         self.cron.cancel_all();
         self.log_channels
@@ -1043,6 +1080,47 @@ impl DaemonCore {
             for (name, cron_expr) in cron_entries {
                 self.cron.schedule(&name, &cron_expr);
             }
+
+            let mut listeners: Vec<(String, NatsTrigger, Option<i32>)> = Vec::new();
+            for name in self.config.script_names(config_path) {
+                if self.nats.is_listening(&name) {
+                    continue;
+                }
+                let mut stored: Option<&ScriptState> = None;
+                for script in &scripts {
+                    if script.name == name {
+                        stored = Some(script);
+                    }
+                }
+                if stored.is_some_and(|script| script.explicitly_stopped) {
+                    continue;
+                }
+                let Some(script_def) = self.config.script(config_path, &name) else {
+                    continue;
+                };
+                let Some(trigger) = script_def.nats.clone() else {
+                    continue;
+                };
+                let exit_code = stored.and_then(|script| script.exit_code);
+                listeners.push((name, trigger, exit_code));
+            }
+
+            for (name, trigger, exit_code) in listeners {
+                tracing::info!(script = %name, "Restoring NATS listener");
+                self.register_listener(&name, config_path, &trigger).await;
+                if let Err(e) = self
+                    .update_script_state_with_config(
+                        &name,
+                        config_path,
+                        ProcessStatus::Listening,
+                        false,
+                        exit_code,
+                    )
+                    .await
+                {
+                    tracing::error!(script = %name, error = ?e, "Failed to persist listening state during restore");
+                }
+            }
         }
 
         tracing::info!("State restoration completed");
@@ -1148,6 +1226,7 @@ impl DaemonCore {
                 .remove(name);
         }
         self.cron.cancel(name);
+        self.nats.cancel(name).await;
         if let Err(e) = self.state.remove_script(name).await {
             tracing::error!(script = %name, error = ?e, "Failed to remove from state during forget_script");
         }
@@ -1212,6 +1291,7 @@ impl DaemonCore {
                         }
                     }
                     self.cron.cancel(&name);
+                    self.nats.cancel(&name).await;
                     if was_running {
                         if let Err(e) = self.start_script(&name, &other_path).await {
                             tracing::error!(script = %name, error = ?e, "Failed to start from rebound config");
@@ -1238,12 +1318,17 @@ impl DaemonCore {
                             }
                         }
                     } else if !was_explicitly_stopped {
+                        let mut trigger: Option<NatsTrigger> = None;
                         if let Some(def) = self.config.script(&other_path, &name) {
                             if let Some(cron_expr) = def.cron.as_ref() {
                                 if !self.cron.is_scheduled(&name) {
                                     self.cron.schedule(&name, cron_expr);
                                 }
                             }
+                            trigger = def.nats.clone();
+                        }
+                        if let Some(trigger) = trigger {
+                            self.register_listener(&name, &other_path, &trigger).await;
                         }
                     }
                 }
@@ -1263,8 +1348,36 @@ impl DaemonCore {
                 tracing::error!(script = %name, error = ?e, "Failed to stop during reload");
             }
             self.cron.cancel(&name);
+            self.nats.cancel(&name).await;
             if let Err(e) = self.start_script(&name, config_path).await {
                 tracing::error!(script = %name, error = ?e, "Failed to start during reload");
+            }
+        }
+
+        if diff.nats_url_changed {
+            tracing::info!(config = ?config_path, "NATS settings changed, re-registering listeners");
+            let mut listeners: Vec<(String, NatsTrigger)> = Vec::new();
+            for name in self.config.script_names(config_path) {
+                let mut stopped = false;
+                for script in &self.state.scripts {
+                    if script.name == name && script.explicitly_stopped {
+                        stopped = true;
+                    }
+                }
+                if stopped {
+                    continue;
+                }
+                let Some(script_def) = self.config.script(config_path, &name) else {
+                    continue;
+                };
+                let Some(trigger) = script_def.nats.clone() else {
+                    continue;
+                };
+                listeners.push((name, trigger));
+            }
+
+            for (name, trigger) in listeners {
+                self.register_listener(&name, config_path, &trigger).await;
             }
         }
 
@@ -1735,13 +1848,13 @@ scripts:
         assert!(health.contains_key("bar"));
     }
 
-    fn job_config(command: &str) -> String {
+    fn job_config_with_url(command: &str, url: &str) -> String {
         format!(
             r#"
 settings:
   log_dir: "./logs"
   nats:
-    url: "nats://127.0.0.1:14222"
+    url: "{url}"
 scripts:
   job:
     command: "{command}"
@@ -1754,6 +1867,23 @@ scripts:
         )
     }
 
+    fn job_config(command: &str) -> String {
+        job_config_with_url(command, DEAD_NATS_URL)
+    }
+
+    const DEAD_NATS_URL: &str = "nats://127.0.0.1:14222";
+
+    const CONFIG_JOB_WITHOUT_NATS: &str = r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://127.0.0.1:14222"
+scripts:
+  job:
+    command: "echo job"
+    restart_policy: "never"
+"#;
+
     async fn setup_job_core(command: &str) -> (DaemonCore, TempDir, PathBuf) {
         let (mut core, tmp) = make_core();
         let cfg_path = tmp.path().join("jobs.yml");
@@ -1763,6 +1893,14 @@ scripts:
             .update_script(dummy_script_state("job", Some(cfg_path.clone())))
             .await
             .unwrap();
+        let trigger = core
+            .config
+            .script(&cfg_path, "job")
+            .expect("job must be in config")
+            .nats
+            .clone()
+            .expect("job must carry a nats trigger");
+        core.register_listener("job", &cfg_path, &trigger).await;
         (core, tmp, cfg_path)
     }
 
@@ -1782,19 +1920,22 @@ scripts:
     }
 
     async fn drain_process_exit(core: &mut DaemonCore) {
-        let event = tokio::time::timeout(Duration::from_secs(5), core.event_rx.recv())
-            .await
-            .expect("timed out waiting for ProcessExited")
-            .expect("event channel closed");
-        let DaemonEvent::ProcessExited {
-            name,
-            instance_id,
-            status,
-        } = event
-        else {
-            panic!("expected a ProcessExited event");
-        };
-        core.handle_process_exit(&name, instance_id, status).await;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), core.event_rx.recv())
+                .await
+                .expect("timed out waiting for ProcessExited")
+                .expect("event channel closed");
+            let DaemonEvent::ProcessExited {
+                name,
+                instance_id,
+                status,
+            } = event
+            else {
+                continue;
+            };
+            core.handle_process_exit(&name, instance_id, status).await;
+            return;
+        }
     }
 
     #[tokio::test]
@@ -1932,6 +2073,154 @@ scripts:
         let health = snapshot.get("job").expect("health entry must exist");
         assert!(health.healthy);
         assert!(!is_failed(&health.state));
+    }
+
+    async fn setup_listening_core(command: &str) -> (DaemonCore, TempDir, PathBuf) {
+        let (mut core, tmp) = make_core();
+        let cfg_path = tmp.path().join("jobs.yml");
+        std::fs::write(&cfg_path, job_config(command)).unwrap();
+        core.config.load(&cfg_path).unwrap();
+        core.start_scripts(Some("job".to_string()), &cfg_path)
+            .await
+            .unwrap();
+        (core, tmp, cfg_path)
+    }
+
+    fn stored_status(core: &DaemonCore, name: &str) -> ScriptState {
+        core.state
+            .scripts
+            .iter()
+            .find(|s| s.name == name)
+            .expect("script must be in state")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn up_on_nats_script_registers_listener_instead_of_spawning() {
+        let (core, _tmp, _cfg) = setup_listening_core("echo job").await;
+
+        assert!(core.nats.is_listening("job"));
+        assert!(!core.supervisor.contains("job"));
+
+        let entry = stored_status(&core, "job");
+        assert_eq!(entry.status, ProcessStatus::Listening);
+        assert!(!entry.explicitly_stopped);
+
+        let snapshot = core.health.read().await;
+        assert!(snapshot.contains_key("job"));
+    }
+
+    #[tokio::test]
+    async fn down_on_nats_script_cancels_listener_and_persists_stopped() {
+        let (mut core, _tmp, cfg_path) = setup_listening_core("echo job").await;
+
+        core.stop_scripts(Some("job".to_string()), Some(&cfg_path))
+            .await
+            .unwrap();
+
+        assert!(!core.nats.is_listening("job"));
+        let entry = stored_status(&core, "job");
+        assert_eq!(entry.status, ProcessStatus::Stopped);
+        assert!(entry.explicitly_stopped);
+    }
+
+    #[tokio::test]
+    async fn job_trigger_without_listener_replies_not_started() {
+        let (mut core, tmp) = make_core();
+        let cfg_path = tmp.path().join("jobs.yml");
+        std::fs::write(&cfg_path, job_config("echo job")).unwrap();
+        core.config.load(&cfg_path).unwrap();
+        core.state
+            .update_script(dummy_script_state("job", Some(cfg_path)))
+            .await
+            .unwrap();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+
+        assert_eq!(reply_rx.await.unwrap(), JobOutcome::NotStarted);
+        assert!(!core.supervisor.contains("job"));
+    }
+
+    #[tokio::test]
+    async fn reload_removing_nats_block_cancels_the_listener() {
+        let (mut core, _tmp, cfg_path) = setup_listening_core("echo job").await;
+
+        std::fs::write(&cfg_path, CONFIG_JOB_WITHOUT_NATS).unwrap();
+        core.reload_config(&cfg_path).await.unwrap();
+
+        assert!(!core.nats.is_listening("job"));
+    }
+
+    async fn restore_with_stored_job(
+        status: ProcessStatus,
+        explicitly_stopped: bool,
+    ) -> (DaemonCore, TempDir) {
+        let (mut core, tmp) = make_core();
+        let cfg_path = tmp.path().join("jobs.yml");
+        std::fs::write(&cfg_path, job_config("echo job")).unwrap();
+
+        let mut state = dummy_script_state("job", Some(cfg_path));
+        state.status = status;
+        state.explicitly_stopped = explicitly_stopped;
+        state.exit_code = Some(0);
+        core.state.update_script(state).await.unwrap();
+
+        core.restore_state().await.unwrap();
+        (core, tmp)
+    }
+
+    #[tokio::test]
+    async fn restore_state_relistens_a_stored_listening_job() {
+        let (core, _tmp) = restore_with_stored_job(ProcessStatus::Listening, false).await;
+
+        assert!(core.nats.is_listening("job"));
+        assert!(!core.supervisor.contains("job"));
+        assert_eq!(stored_status(&core, "job").status, ProcessStatus::Listening);
+    }
+
+    #[tokio::test]
+    async fn restore_state_relistens_a_stored_stopped_job() {
+        let (core, _tmp) = restore_with_stored_job(ProcessStatus::Stopped, false).await;
+
+        assert!(core.nats.is_listening("job"));
+        let entry = stored_status(&core, "job");
+        assert_eq!(entry.status, ProcessStatus::Listening);
+        assert_eq!(entry.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn restore_state_skips_an_explicitly_stopped_job() {
+        let (core, _tmp) = restore_with_stored_job(ProcessStatus::Stopped, true).await;
+
+        assert!(!core.nats.is_listening("job"));
+        assert_eq!(stored_status(&core, "job").status, ProcessStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn reload_with_changed_nats_url_relistens() {
+        let (mut core, _tmp, cfg_path) = setup_listening_core("echo job").await;
+        core.nats.cancel("job").await;
+        assert!(!core.nats.is_listening("job"));
+
+        std::fs::write(
+            &cfg_path,
+            job_config_with_url("echo job", "nats://127.0.0.1:14223"),
+        )
+        .unwrap();
+        core.reload_config(&cfg_path).await.unwrap();
+
+        assert!(core.nats.is_listening("job"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_listeners_before_stopping_processes() {
+        let (mut core, _tmp, _cfg) = setup_listening_core("echo job").await;
+
+        core.shutdown().await.unwrap();
+
+        assert!(!core.nats.is_listening("job"));
+        assert!(core.supervisor.names().is_empty());
     }
 
     #[tokio::test]

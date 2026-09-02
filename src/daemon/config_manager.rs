@@ -7,6 +7,7 @@ pub struct ConfigDiff {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed: Vec<String>,
+    pub nats_url_changed: bool,
 }
 
 pub struct ConfigManager {
@@ -101,6 +102,13 @@ impl ConfigManager {
             .map(|c| c.settings.log_dir.as_path())
     }
 
+    pub fn nats_url(&self, config_path: &Path) -> Option<String> {
+        self.configs
+            .get(config_path)
+            .and_then(|c| c.settings.nats.as_ref())
+            .map(|nats| nats.url.clone())
+    }
+
     pub fn loki_config(&self, config_path: &Path) -> Option<&LokiConfig> {
         self.configs
             .get(config_path)
@@ -139,6 +147,8 @@ impl ConfigManager {
 
         let new_config = self.configs.get(config_path).expect("just inserted");
 
+        let nats_url_changed = old_config.settings.nats != new_config.settings.nats;
+
         let old_names: HashSet<String> = old_config.scripts.keys().cloned().collect();
         let new_names: HashSet<String> = new_config.scripts.keys().cloned().collect();
 
@@ -155,6 +165,7 @@ impl ConfigManager {
             added,
             removed,
             changed,
+            nats_url_changed,
         })
     }
 }
@@ -427,6 +438,55 @@ scripts:
 
         let script = mgr.script(file_b.path(), "job_b").unwrap();
         assert_eq!(script.nats.as_ref().unwrap().durable, "other");
+    }
+
+    fn nats_config_with_url(script: &str, url: &str) -> String {
+        format!(
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "{url}"
+scripts:
+  {script}:
+    command: "echo job"
+    restart_policy: "never"
+    nats:
+      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "{script}"
+"#
+        )
+    }
+
+    #[test]
+    fn reload_reports_nats_url_change_with_unchanged_scripts() {
+        let file = write_config(&nats_config_with_url("job", "nats://127.0.0.1:4222"));
+        let mut mgr = ConfigManager::new();
+        mgr.load(file.path()).unwrap();
+
+        std::fs::write(
+            file.path(),
+            nats_config_with_url("job", "nats://127.0.0.1:4333").as_bytes(),
+        )
+        .unwrap();
+        let diff = mgr.reload(file.path()).unwrap();
+
+        assert!(diff.nats_url_changed);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.changed.is_empty());
+    }
+
+    #[test]
+    fn reload_without_nats_change_reports_unchanged_url() {
+        let file = write_config(&nats_config_with_url("job", "nats://127.0.0.1:4222"));
+        let mut mgr = ConfigManager::new();
+        mgr.load(file.path()).unwrap();
+
+        let diff = mgr.reload(file.path()).unwrap();
+
+        assert!(!diff.nats_url_changed);
     }
 
     #[test]
