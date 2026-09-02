@@ -55,6 +55,12 @@ enum PublishFailure {
     Transient(String),
 }
 
+enum ResultFile {
+    NotNeeded,
+    Created(PathBuf),
+    Failed,
+}
+
 struct Attempt {
     input: JobInput,
     stream_sequence: u64,
@@ -383,12 +389,22 @@ impl Session {
             return AfterMessage::Continue;
         };
 
+        let result_path = match self.prepare_result_file() {
+            ResultFile::NotNeeded => None,
+            ResultFile::Created(path) => Some(path),
+            ResultFile::Failed => {
+                tracing::error!(script = %name, %subject, stream_sequence, "Cannot create the job result file, retrying the message without running the job");
+                self.settle(&message, Verdict::Nak).await;
+                return AfterMessage::Continue;
+            }
+        };
+
         let input = JobInput {
             payload,
             subject,
             delivery,
             traceparent: traceparent(message.headers.as_ref()),
-            result_path: self.prepare_result_file(),
+            result_path,
         };
         let env = job::job_env(&input);
         let attempt = Attempt {
@@ -605,22 +621,24 @@ impl Session {
         }
     }
 
-    fn prepare_result_file(&self) -> Option<PathBuf> {
-        self.config.trigger.publish.as_ref()?;
+    fn prepare_result_file(&self) -> ResultFile {
+        if self.config.trigger.publish.is_none() {
+            return ResultFile::NotNeeded;
+        }
 
         let dir = paths::jobs_dir();
         if let Err(e) = paths::ensure_dir(&dir) {
             tracing::error!(script = %self.config.name, error = %e, "Failed to create jobs directory");
-            return None;
+            return ResultFile::Failed;
         }
 
         let path = paths::result_path(&self.config.name);
         if let Err(e) = std::fs::write(&path, b"") {
             tracing::error!(script = %self.config.name, error = %e, "Failed to create job result file");
-            return None;
+            return ResultFile::Failed;
         }
 
-        Some(path)
+        ResultFile::Created(path)
     }
 
     fn remove_result_file(&self, attempt: &Attempt) {

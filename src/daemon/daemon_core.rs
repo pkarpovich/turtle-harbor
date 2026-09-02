@@ -665,6 +665,16 @@ impl DaemonCore {
             Err(e) => {
                 tracing::error!(script = %name, error = ?e, "Job-triggered start failed");
                 let _ = reply_tx.send(JobOutcome::NotStarted);
+                let mut snapshot = self.health.write().await;
+                let entry = snapshot
+                    .entry(name.to_string())
+                    .or_insert_with(|| ScriptHealth::never_ran(name.to_string()));
+                entry.state = ScriptHealthState::Failed;
+                entry.healthy = false;
+                entry.last_run_at = Some(Local::now());
+                entry.last_finished_at = Some(Local::now());
+                entry.last_exit_code = None;
+                entry.pid = None;
             }
         }
     }
@@ -684,6 +694,7 @@ impl DaemonCore {
                 entry.state = ScriptHealthState::Failed;
                 entry.healthy = false;
                 entry.last_finished_at = Some(Local::now());
+                entry.last_exit_code = None;
                 entry.pid = None;
             }
         }
@@ -1355,7 +1366,25 @@ impl DaemonCore {
                             trigger = def.nats.clone();
                         }
                         if let Some(trigger) = trigger {
+                            let exit_code = self
+                                .state
+                                .scripts
+                                .iter()
+                                .find(|s| s.name == name)
+                                .and_then(|s| s.exit_code);
                             self.register_listener(&name, &other_path, &trigger).await;
+                            if let Err(e) = self
+                                .update_script_state_with_config(
+                                    &name,
+                                    &other_path,
+                                    ProcessStatus::Listening,
+                                    false,
+                                    exit_code,
+                                )
+                                .await
+                            {
+                                tracing::error!(script = %name, error = ?e, "Failed to persist listening state during rebind");
+                            }
                         }
                     }
                 }
@@ -1383,15 +1412,15 @@ impl DaemonCore {
 
         if diff.nats_url_changed {
             tracing::info!(config = ?config_path, "NATS settings changed, re-registering listeners");
-            let mut listeners: Vec<(String, NatsTrigger)> = Vec::new();
+            let mut listeners: Vec<(String, NatsTrigger, Option<i32>)> = Vec::new();
             for name in self.config.script_names(config_path) {
-                let mut stopped = false;
+                let mut stored: Option<&ScriptState> = None;
                 for script in &self.state.scripts {
-                    if script.name == name && script.explicitly_stopped {
-                        stopped = true;
+                    if script.name == name {
+                        stored = Some(script);
                     }
                 }
-                if stopped {
+                if stored.is_some_and(|script| script.explicitly_stopped) {
                     continue;
                 }
                 let Some(script_def) = self.config.script(config_path, &name) else {
@@ -1400,11 +1429,24 @@ impl DaemonCore {
                 let Some(trigger) = script_def.nats.clone() else {
                     continue;
                 };
-                listeners.push((name, trigger));
+                let exit_code = stored.and_then(|script| script.exit_code);
+                listeners.push((name, trigger, exit_code));
             }
 
-            for (name, trigger) in listeners {
+            for (name, trigger, exit_code) in listeners {
                 self.register_listener(&name, config_path, &trigger).await;
+                if let Err(e) = self
+                    .update_script_state_with_config(
+                        &name,
+                        config_path,
+                        ProcessStatus::Listening,
+                        false,
+                        exit_code,
+                    )
+                    .await
+                {
+                    tracing::error!(script = %name, error = ?e, "Failed to persist listening state after NATS settings change");
+                }
             }
         }
 
@@ -2082,6 +2124,31 @@ scripts:
     }
 
     #[tokio::test]
+    async fn listener_ready_keeps_a_timed_out_job_unhealthy() {
+        let (mut core, _tmp, _cfg) = setup_job_core("exit 0").await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+        drain_process_exit(&mut core).await;
+        assert_eq!(reply_rx.await.unwrap(), JobOutcome::Exited(0));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+        core.handle_job_timeout("job").await;
+        assert_eq!(reply_rx.await.unwrap(), JobOutcome::TimedOut);
+
+        core.handle_listener_ready("job").await;
+
+        let snapshot = core.health.read().await;
+        let health = snapshot.get("job").expect("health entry must exist");
+        assert!(
+            !health.healthy,
+            "a listener rebind must not mask the timed-out run"
+        );
+        assert!(is_failed(&health.state));
+    }
+
+    #[tokio::test]
     async fn job_timeout_after_the_run_finished_is_ignored() {
         let (mut core, _tmp, _cfg) = setup_job_core("exit 0").await;
 
@@ -2305,6 +2372,30 @@ scripts:
         core.reload_config(&cfg_path).await.unwrap();
 
         assert!(!core.nats.is_listening("job"));
+    }
+
+    #[tokio::test]
+    async fn reload_with_a_new_nats_url_persists_the_listening_state() {
+        let (mut core, tmp) = make_core();
+        let cfg_path = tmp.path().join("jobs.yml");
+        std::fs::write(&cfg_path, job_config("echo job")).unwrap();
+        core.config.load(&cfg_path).unwrap();
+
+        std::fs::write(
+            &cfg_path,
+            job_config_with_url("echo job", "nats://127.0.0.1:14333"),
+        )
+        .unwrap();
+        core.reload_config(&cfg_path).await.unwrap();
+
+        assert!(core.nats.is_listening("job"));
+        let entry = stored_status(&core, "job");
+        assert_eq!(
+            entry.status,
+            ProcessStatus::Listening,
+            "a listener registered after a URL change must be resolvable by handle_job_trigger"
+        );
+        assert_eq!(entry.config_path, Some(cfg_path));
     }
 
     async fn restore_with_stored_job(
