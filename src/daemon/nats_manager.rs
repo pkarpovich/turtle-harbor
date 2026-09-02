@@ -112,6 +112,14 @@ impl NatsManager {
         tracing::info!(script = %name, "Listener registered");
     }
 
+    pub fn signal_stop(&self, names: &[String]) {
+        for name in names {
+            if let Some(listener) = self.tasks.get(name) {
+                let _ = listener.shutdown.send(true);
+            }
+        }
+    }
+
     pub async fn cancel(&mut self, name: &str) {
         let Some(Listener { handle, shutdown }) = self.tasks.remove(name) else {
             return;
@@ -892,6 +900,26 @@ mod tests {
 
         manager.cancel_all().await;
         assert!(!manager.is_listening("first"));
+        assert!(!manager.is_listening("second"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_stop_keeps_listeners_registered_until_cancelled() {
+        let mut manager = make_manager();
+        let trigger = make_trigger();
+
+        manager.listen("first", &trigger, DEAD_URL).await;
+        manager.listen("second", &trigger, DEAD_URL).await;
+
+        manager.signal_stop(&["first".to_string(), "nobody".to_string()]);
+        assert!(manager.is_listening("first"));
+        assert!(manager.is_listening("second"));
+
+        manager.cancel("first").await;
+        assert!(!manager.is_listening("first"));
+        assert!(manager.is_listening("second"));
+
+        manager.cancel_all().await;
         assert!(!manager.is_listening("second"));
     }
 

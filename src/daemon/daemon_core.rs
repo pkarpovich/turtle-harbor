@@ -841,6 +841,7 @@ impl DaemonCore {
                 all
             }
         };
+        self.nats.signal_stop(&names);
         for name in names {
             self.stop_script(&name).await?;
         }
@@ -1300,6 +1301,7 @@ impl DaemonCore {
         let diff = self.config.reload(config_path)?;
         self.sync_settings(config_path);
 
+        self.nats.signal_stop(&diff.removed);
         for name in diff.removed {
             match self.config.has_script_globally(&name) {
                 None => {
@@ -1424,6 +1426,7 @@ impl DaemonCore {
             }
         }
 
+        self.nats.signal_stop(&diff.changed);
         for name in diff.changed {
             tracing::info!(script = %name, "Script config changed, restarting");
             if let Err(e) = self.stop_script(&name).await {
@@ -1459,6 +1462,9 @@ impl DaemonCore {
                 listeners.push((name, trigger, exit_code));
             }
 
+            let rebinding: Vec<String> =
+                listeners.iter().map(|(name, _, _)| name.clone()).collect();
+            self.nats.signal_stop(&rebinding);
             for (name, trigger, exit_code) in listeners {
                 self.abort_job_before_rebind(&name).await;
                 self.register_listener(&name, config_path, &trigger).await;
