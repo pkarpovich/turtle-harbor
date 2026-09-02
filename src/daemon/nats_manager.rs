@@ -192,6 +192,13 @@ impl NatsManager {
         };
         !listener.handle.is_finished() && listener.trigger == *trigger && listener.url == url
     }
+
+    #[cfg(test)]
+    pub fn is_stopping(&self, name: &str) -> bool {
+        self.tasks
+            .get(name)
+            .is_some_and(|listener| *listener.shutdown.borrow())
+    }
 }
 
 pub fn consumer_config(trigger: &NatsTrigger) -> pull::Config {
@@ -362,13 +369,18 @@ async fn bind(config: &ListenerConfig) -> std::result::Result<Session, String> {
 
     let server = &consumer.cached_info().config;
     let max_deliver = server_max_deliver(server.max_deliver);
-    if max_deliver != trigger.max_deliver || server.ack_wait != trigger.ack_wait {
+    if max_deliver != trigger.max_deliver
+        || server.ack_wait != trigger.ack_wait
+        || server.filter_subject != trigger.subject
+    {
         tracing::warn!(
             script = %name,
             server_max_deliver = max_deliver,
             config_max_deliver = trigger.max_deliver,
             server_ack_wait = ?server.ack_wait,
             config_ack_wait = ?trigger.ack_wait,
+            server_subject = %server.filter_subject,
+            config_subject = %trigger.subject,
             "Durable exists with different settings - server values apply"
         );
     }

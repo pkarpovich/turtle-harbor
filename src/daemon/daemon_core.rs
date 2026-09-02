@@ -883,6 +883,8 @@ impl DaemonCore {
             return Ok(ScriptStartResult::Started);
         }
 
+        self.nats.cancel(name).await;
+
         let cron = script_def.cron.clone();
         let config_dir = self.config.config_dir(config_path);
         let broadcast_tx = self.register_log_channel(name);
@@ -1469,7 +1471,7 @@ impl DaemonCore {
                 listeners.iter().map(|(name, _, _)| name.clone()).collect();
             self.nats.signal_stop(&rebinding);
             for (name, trigger, exit_code) in listeners {
-                self.abort_job_before_rebind(&name).await;
+                self.nats.cancel(&name).await;
                 self.register_listener(&name, config_path, &trigger).await;
                 if let Err(e) = self
                     .update_script_state_with_config(
@@ -2515,6 +2517,63 @@ scripts:
         core.reload_config(&cfg_path).await.unwrap();
 
         assert!(core.nats.is_listening("job"));
+    }
+
+    fn two_job_config_with_url(url: &str) -> String {
+        format!(
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "{url}"
+scripts:
+  job:
+    command: "echo job"
+    restart_policy: "never"
+    nats:
+      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "job"
+  job2:
+    command: "echo job2"
+    restart_policy: "never"
+    nats:
+      stream: "recordings"
+      subject: "recordings.started"
+      durable: "job2"
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn reload_adding_a_job_while_the_url_changes_leaves_it_live() {
+        let (mut core, _tmp, cfg_path) = setup_listening_core("echo job").await;
+
+        std::fs::write(&cfg_path, two_job_config_with_url("nats://127.0.0.1:14444")).unwrap();
+        core.reload_config(&cfg_path).await.unwrap();
+
+        for name in ["job", "job2"] {
+            assert!(core.nats.is_listening(name));
+            assert!(
+                !core.nats.is_stopping(name),
+                "{name} was signalled to stop by the URL change and never rebound"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn up_after_removing_the_nats_block_cancels_the_listener() {
+        let (mut core, _tmp, cfg_path) = setup_listening_core("echo job").await;
+        assert!(core.nats.is_listening("job"));
+
+        std::fs::write(&cfg_path, CONFIG_JOB_WITHOUT_NATS).unwrap();
+        core.config.load(&cfg_path).unwrap();
+        core.start_scripts(Some("job".to_string()), &cfg_path)
+            .await
+            .unwrap();
+
+        assert!(!core.nats.is_listening("job"));
+        assert!(core.supervisor.contains("job"));
     }
 
     fn trigger_of(core: &DaemonCore, cfg_path: &Path, name: &str) -> NatsTrigger {
