@@ -485,15 +485,19 @@ impl Session {
         };
 
         let (reply_tx, reply_rx) = oneshot::channel();
-        let sent = self
-            .config
-            .event_tx
-            .send(DaemonEvent::JobTrigger {
+        let sent = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                self.nak_now(&message).await;
+                self.remove_result_file(&attempt);
+                return AfterMessage::Stop;
+            }
+            sent = self.config.event_tx.send(DaemonEvent::JobTrigger {
                 name: self.config.name.clone(),
                 env,
                 reply_tx,
-            })
-            .await;
+            }) => sent,
+        };
         let Ok(()) = sent else {
             self.nak_now(&message).await;
             self.remove_result_file(&attempt);
@@ -586,13 +590,13 @@ impl Session {
         let name = self.config.name.as_str();
         tracing::error!(script = %name, timeout_secs = self.config.trigger.job_timeout.as_secs(), "Job exceeded job_timeout");
 
-        let sent = self
-            .config
-            .event_tx
-            .send(DaemonEvent::JobTimeout {
+        let sent = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return JobResolution::Shutdown,
+            sent = self.config.event_tx.send(DaemonEvent::JobTimeout {
                 name: self.config.name.clone(),
-            })
-            .await;
+            }) => sent,
+        };
         let Ok(()) = sent else {
             return JobResolution::Outcome(JobOutcome::TimedOut);
         };

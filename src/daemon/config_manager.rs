@@ -86,6 +86,16 @@ impl ConfigManager {
             .is_some_and(|c| c.scripts.contains_key(name))
     }
 
+    pub fn script_owner_excluding(&self, name: &str, skip: &Path) -> Option<PathBuf> {
+        self.configs.iter().find_map(|(path, config)| {
+            if path.as_path() != skip && config.scripts.contains_key(name) {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn has_script_globally(&self, name: &str) -> Option<PathBuf> {
         self.configs.iter().find_map(|(path, config)| {
             if config.scripts.contains_key(name) {

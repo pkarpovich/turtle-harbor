@@ -283,26 +283,28 @@ impl DaemonCore {
                 self.sync_settings(&config_path);
 
                 if let Some(ref script_name) = name {
-                    if let Some(existing) = self.config.has_script_globally(script_name) {
-                        if existing != config_path {
+                    if let Some(existing) = self
+                        .config
+                        .script_owner_excluding(script_name, &config_path)
+                    {
+                        return Response::Error(format!(
+                            "script '{}' already registered from '{}'",
+                            script_name,
+                            existing.display()
+                        ));
+                    }
+                } else {
+                    let new_names: Vec<String> = self.config.script_names(&config_path);
+                    for script_name in &new_names {
+                        if let Some(existing) = self
+                            .config
+                            .script_owner_excluding(script_name, &config_path)
+                        {
                             return Response::Error(format!(
                                 "script '{}' already registered from '{}'",
                                 script_name,
                                 existing.display()
                             ));
-                        }
-                    }
-                } else {
-                    let new_names: Vec<String> = self.config.script_names(&config_path);
-                    for script_name in &new_names {
-                        if let Some(existing) = self.config.has_script_globally(script_name) {
-                            if existing != config_path {
-                                return Response::Error(format!(
-                                    "script '{}' already registered from '{}'",
-                                    script_name,
-                                    existing.display()
-                                ));
-                            }
                         }
                     }
                 }
@@ -865,6 +867,14 @@ impl DaemonCore {
             .clone();
 
         if let Some(trigger) = script_def.nats.clone() {
+            self.cron.cancel(name);
+            if self.supervisor.contains(name) {
+                self.supervisor.stop_script(name).await?;
+                self.log_channels
+                    .lock()
+                    .expect("log_channels mutex poisoned")
+                    .remove(name);
+            }
             self.update_script_state_with_config(
                 name,
                 config_path,
@@ -2574,6 +2584,50 @@ scripts:
 
         assert!(!core.nats.is_listening("job"));
         assert!(core.supervisor.contains("job"));
+    }
+
+    #[tokio::test]
+    async fn up_after_adding_the_nats_block_stops_the_running_process_and_its_cron() {
+        let (mut core, tmp) = make_core();
+        let cfg_path = tmp.path().join("jobs.yml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://127.0.0.1:14222"
+scripts:
+  job:
+    command: "sleep 30"
+    restart_policy: "never"
+    cron: "0 */1 * * * * *"
+"#,
+        )
+        .unwrap();
+        core.config.load(&cfg_path).unwrap();
+        core.start_scripts(Some("job".to_string()), &cfg_path)
+            .await
+            .unwrap();
+        assert!(core.supervisor.contains("job"));
+        assert!(core.cron.is_scheduled("job"));
+
+        std::fs::write(&cfg_path, job_config("sleep 30")).unwrap();
+        core.config.load(&cfg_path).unwrap();
+        core.start_scripts(Some("job".to_string()), &cfg_path)
+            .await
+            .unwrap();
+
+        assert!(core.nats.is_listening("job"));
+        assert!(
+            !core.supervisor.contains("job"),
+            "up on a script that gained a nats block must stop the process it used to run"
+        );
+        assert!(
+            !core.cron.is_scheduled("job"),
+            "up on a script that gained a nats block must cancel its cron schedule"
+        );
+        assert_eq!(stored_status(&core, "job").status, ProcessStatus::Listening);
     }
 
     fn trigger_of(core: &DaemonCore, cfg_path: &Path, name: &str) -> NatsTrigger {
