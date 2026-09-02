@@ -701,6 +701,11 @@ impl DaemonCore {
     }
 
     async fn handle_listener_ready(&mut self, name: &str) {
+        if !self.nats.is_listening(name) {
+            tracing::info!(script = %name, "Listener ready dropped - listener no longer registered");
+            return;
+        }
+
         tracing::info!(script = %name, "NATS listener ready");
         let mut snapshot = self.health.write().await;
         let entry = snapshot
@@ -722,6 +727,11 @@ impl DaemonCore {
     }
 
     async fn handle_listener_failed(&mut self, name: &str, error: &str) {
+        if !self.nats.is_listening(name) {
+            tracing::info!(script = %name, "Listener failure dropped - listener no longer registered");
+            return;
+        }
+
         tracing::warn!(script = %name, error, "NATS listener failed");
         let mut snapshot = self.health.write().await;
         let entry = snapshot
@@ -2166,7 +2176,7 @@ scripts:
 
     #[tokio::test]
     async fn listener_failed_then_ready_toggles_health() {
-        let (mut core, _tmp) = make_core();
+        let (mut core, _tmp, _cfg) = setup_job_core("echo job").await;
 
         core.handle_listener_failed("job", "connection refused")
             .await;
@@ -2183,6 +2193,41 @@ scripts:
         let health = snapshot.get("job").expect("health entry must exist");
         assert!(health.healthy);
         assert!(!is_failed(&health.state));
+    }
+
+    #[tokio::test]
+    async fn listener_failure_queued_behind_a_stop_is_dropped() {
+        let (mut core, _tmp, cfg_path) = setup_listening_core("echo job").await;
+
+        core.stop_scripts(Some("job".to_string()), Some(&cfg_path))
+            .await
+            .unwrap();
+
+        core.handle_listener_failed("job", "connection refused")
+            .await;
+
+        let snapshot = core.health.read().await;
+        let health = snapshot.get("job").expect("health entry must exist");
+        assert!(
+            health.healthy,
+            "a listener failure sent before the cancel must not outlive the stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_failure_queued_behind_a_forget_creates_no_health_entry() {
+        let (mut core, _tmp, _cfg) = setup_listening_core("echo job").await;
+
+        core.forget_script("job").await;
+
+        core.handle_listener_failed("job", "connection refused")
+            .await;
+
+        let snapshot = core.health.read().await;
+        assert!(
+            !snapshot.contains_key("job"),
+            "a forgotten script must not be resurrected in /health"
+        );
     }
 
     async fn setup_listening_core(command: &str) -> (DaemonCore, TempDir, PathBuf) {

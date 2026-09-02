@@ -196,8 +196,18 @@ pub fn server_max_deliver(max_deliver: i64) -> u32 {
     u32::try_from(max_deliver).unwrap_or(u32::MAX)
 }
 
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some((_, host)) = rest.rsplit_once('@') else {
+        return url.to_string();
+    };
+    format!("{scheme}://***@{host}")
+}
+
 async fn run_listener(config: ListenerConfig, mut shutdown: watch::Receiver<bool>) {
-    tracing::debug!(script = %config.name, url = %config.url, subject = %config.trigger.subject, "Listener started");
+    tracing::debug!(script = %config.name, url = %redact_url(&config.url), subject = %config.trigger.subject, "Listener started");
 
     loop {
         if *shutdown.borrow() {
@@ -287,7 +297,7 @@ async fn bind(config: &ListenerConfig) -> std::result::Result<Session, String> {
         .await;
     let client = match client {
         Ok(client) => client,
-        Err(e) => return Err(format!("connect to {url}: {e}")),
+        Err(e) => return Err(format!("connect to {}: {e}", redact_url(url))),
     };
 
     let context = jetstream::new(client);
@@ -662,6 +672,23 @@ mod tests {
     fn make_manager() -> NatsManager {
         let (event_tx, _event_rx) = mpsc::channel(16);
         NatsManager::new(event_tx)
+    }
+
+    #[test]
+    fn test_redact_url_strips_credentials() {
+        assert_eq!(
+            redact_url("nats://user:s3cret@nats.example.com:4222"),
+            "nats://***@nats.example.com:4222"
+        );
+        assert_eq!(
+            redact_url("nats://token@nats.example.com:4222"),
+            "nats://***@nats.example.com:4222"
+        );
+        assert_eq!(
+            redact_url("nats://nats.example.com:4222"),
+            "nats://nats.example.com:4222"
+        );
+        assert_eq!(redact_url("not a url"), "not a url");
     }
 
     #[test]
