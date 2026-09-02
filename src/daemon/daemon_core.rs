@@ -711,6 +711,31 @@ impl DaemonCore {
         }
     }
 
+    async fn abort_job_before_rebind(&mut self, name: &str) {
+        if !self.pending_jobs.contains_key(name) {
+            return;
+        }
+
+        tracing::warn!(script = %name, "Stopping in-flight job before rebinding its listener");
+
+        if let Err(e) = self.supervisor.stop_script(name).await {
+            tracing::error!(script = %name, error = ?e, "Failed to stop job during listener rebind");
+        }
+        self.nats.cancel(name).await;
+        self.pending_jobs.remove(name);
+
+        {
+            let mut snapshot = self.health.write().await;
+            if let Some(entry) = snapshot.get_mut(name) {
+                entry.state = ScriptHealthState::Failed;
+                entry.healthy = false;
+                entry.last_finished_at = Some(Local::now());
+                entry.last_exit_code = None;
+                entry.pid = None;
+            }
+        }
+    }
+
     async fn handle_listener_ready(&mut self, name: &str) {
         if !self.nats.is_listening(name) {
             tracing::info!(script = %name, "Listener ready dropped - listener no longer registered");
@@ -1330,6 +1355,7 @@ impl DaemonCore {
                     }
                     self.cron.cancel(&name);
                     self.nats.cancel(&name).await;
+                    self.pending_jobs.remove(&name);
                     if was_running {
                         if let Err(e) = self.start_script(&name, &other_path).await {
                             tracing::error!(script = %name, error = ?e, "Failed to start from rebound config");
@@ -1434,6 +1460,7 @@ impl DaemonCore {
             }
 
             for (name, trigger, exit_code) in listeners {
+                self.abort_job_before_rebind(&name).await;
                 self.register_listener(&name, config_path, &trigger).await;
                 if let Err(e) = self
                     .update_script_state_with_config(
@@ -2115,6 +2142,28 @@ scripts:
             .expect("job must remain in state");
         assert_eq!(entry.status, ProcessStatus::Listening);
         assert_eq!(entry.exit_code, None);
+
+        let snapshot = core.health.read().await;
+        let health = snapshot.get("job").expect("health entry must exist");
+        assert!(!health.healthy);
+        assert!(is_failed(&health.state));
+        assert_eq!(health.pid, None);
+    }
+
+    #[tokio::test]
+    async fn rebinding_a_listener_stops_the_in_flight_job() {
+        let (mut core, _tmp, _cfg) = setup_job_core("sleep 30").await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+        assert!(core.supervisor.contains("job"));
+
+        core.abort_job_before_rebind("job").await;
+
+        assert!(!core.supervisor.contains("job"));
+        assert!(core.pending_jobs.is_empty());
+        assert!(!core.nats.is_listening("job"));
+        assert!(reply_rx.await.is_err());
 
         let snapshot = core.health.read().await;
         let health = snapshot.get("job").expect("health entry must exist");
