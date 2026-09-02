@@ -386,16 +386,24 @@ A new variant, persisted in `state.json`. `th ps` renders it as `listening` (dim
 
 ### Task 9: Verify acceptance criteria
 
-- [ ] verify every `JobOutcome` at both sides of the `max_deliver` boundary has a test in `job.rs`; the publish and result-file branches are covered by the Task 7 `read_result` tests and the acceptance run, the stop-nak by the acceptance run
-- [ ] verify a config without `nats` produces the same `DaemonCore` behaviour as before (the 43 tests present at Task 1 are untouched and green)
-- [ ] verify the four config-validation rules reject at load or reload with the documented errors
-- [ ] verify shutdown order in `DaemonCore::shutdown`: `nats.cancel_all()` runs before `supervisor.shutdown_all()`
-- [ ] verify `handle_job_timeout` does not depend on the watcher's `ProcessExited` (the reply and state transition happen before `stop_script`)
-- [ ] run full `cargo test` - all tests green
-- [ ] run `cargo clippy --all-targets -- -D warnings` - zero warnings
-- [ ] run `cargo fmt --check` - clean
-- [ ] run `cargo build --release` - compiles for the host
-- [ ] run the Code-Quality diff greps over the full feature diff (`git diff <task-1-commit>..HEAD -U0 -- src/`) - each prints nothing
+- [x] verify every `JobOutcome` at both sides of the `max_deliver` boundary has a test in `job.rs`; the publish and result-file branches are covered by the Task 7 `read_result` tests and the acceptance run, the stop-nak by the acceptance run
+- [x] verify a config without `nats` produces the same `DaemonCore` behaviour as before (the 43 tests present at Task 1 are untouched and green)
+- [x] verify the four config-validation rules reject at load or reload with the documented errors
+- [x] verify shutdown order in `DaemonCore::shutdown`: `nats.cancel_all()` runs before `supervisor.shutdown_all()`
+- [x] verify `handle_job_timeout` does not depend on the watcher's `ProcessExited` (the reply and state transition happen before `stop_script`)
+- [x] run full `cargo test` - all tests green
+- [x] run `cargo clippy --all-targets -- -D warnings` - zero warnings
+- [x] run `cargo fmt --check` - clean
+- [x] run `cargo build --release` - compiles for the host
+- [x] run the Code-Quality diff greps over the full feature diff (`git diff <task-1-commit>..HEAD -U0 -- src/`) - each prints nothing
+
+Verification record (Task 1 commit is `7e4858e`):
+- `job.rs` covers all six `JobOutcome` variants (`Exited` at `0`/`1`/`65`) at `delivered < max_deliver`, `delivered == max_deliver` and `delivered > max_deliver`; `read_result` has four tests (object, absent, empty, non-JSON).
+- Exactly 43 tests existed at `7e4858e`; all 43 names still run and pass at HEAD, and the feature diff removes no line from any pre-existing test body. The suite is now 96 green (94 lib + 2 `th`).
+- `JobRestartPolicy`, `ConflictingTriggers`, `NatsUrlMissing` each have a test in `config.rs`; `DuplicateDurable` is checked by `ConfigManager::check_durables`, called from both `load` and `reload`, with a test for each path.
+- `daemon_core.rs:887-889`: `nats.cancel_all()` then `supervisor.shutdown_all()` then `cron.cancel_all()`.
+- `handle_job_timeout` (`daemon_core.rs:667`) replies `TimedOut`, sets health `Failed` with `pid: None` and persists `Listening` before calling `supervisor.stop_script`.
+- ➕ the four-plus-parameter grep prints two lines (`register_listener`, `listen`), both false positives: the grep counts the `&mut self` receiver that the rule excludes, so each has three real parameters. The added multi-line signatures (`handle_job_trigger`, `restore_with_stored_job`, `handle_message`, `await_outcome`, `publish_result`) were counted by eye and are at three parameters or fewer. The wildcard, `matches!` and comment greps print nothing.
 
 ### Task 10: [Final] Update documentation and version
 
