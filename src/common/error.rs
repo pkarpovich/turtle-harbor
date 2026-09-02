@@ -48,6 +48,9 @@ pub enum Error {
     #[error("script '{name}' has a nats trigger but settings.nats is missing")]
     NatsUrlMissing { name: String },
 
+    #[error("script '{name}' has an invalid nats trigger: {reason}")]
+    InvalidNatsTrigger { name: String, reason: String },
+
     #[error("durable '{durable}' on stream '{stream}' already registered from '{path}'")]
     DuplicateDurable {
         stream: String,

@@ -210,6 +210,37 @@ fn parse_env_file(path: &Path) -> HashMap<String, String> {
     vars
 }
 
+fn trigger_problem(trigger: &NatsTrigger) -> Option<String> {
+    let NatsTrigger {
+        stream,
+        subject,
+        durable,
+        ack_wait: _,
+        max_deliver,
+        nak_delay: _,
+        job_timeout: _,
+        publish,
+    } = trigger;
+
+    if stream.trim().is_empty() {
+        return Some("stream is empty".to_string());
+    }
+    if subject.trim().is_empty() {
+        return Some("subject is empty".to_string());
+    }
+    if durable.trim().is_empty() {
+        return Some("durable is empty".to_string());
+    }
+    if *max_deliver == 0 {
+        return Some("max_deliver is 0 - JetStream reads that as unlimited".to_string());
+    }
+    if publish.as_ref().is_some_and(|s| s.trim().is_empty()) {
+        return Some("publish is empty".to_string());
+    }
+
+    None
+}
+
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
@@ -224,8 +255,14 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         for (name, script) in &self.scripts {
-            if script.nats.is_none() {
+            let Some(trigger) = &script.nats else {
                 continue;
+            };
+            if let Some(reason) = trigger_problem(trigger) {
+                return Err(Error::InvalidNatsTrigger {
+                    name: name.clone(),
+                    reason,
+                });
             }
             match script.restart_policy {
                 RestartPolicy::Always => {
@@ -499,6 +536,86 @@ scripts:
             Error::NatsUrlMissing { name } => assert_eq!(name, "transcriber"),
             other => panic!("expected NatsUrlMissing error, got {}", other),
         }
+    }
+
+    fn load_trigger_yaml(trigger: &str) -> Error {
+        load_yaml(&format!(
+            r#"
+settings:
+  log_dir: "./logs"
+  nats:
+    url: "nats://127.0.0.1:4222"
+scripts:
+  transcriber:
+    command: "echo job"
+    restart_policy: "never"
+    nats:
+{trigger}
+"#
+        ))
+        .expect_err("expected InvalidNatsTrigger error")
+    }
+
+    fn assert_invalid_trigger(trigger: &str, expected_reason: &str) {
+        match load_trigger_yaml(trigger) {
+            Error::InvalidNatsTrigger { name, reason } => {
+                assert_eq!(name, "transcriber");
+                assert_eq!(reason, expected_reason);
+            }
+            other => panic!("expected InvalidNatsTrigger error, got {}", other),
+        }
+    }
+
+    #[test]
+    fn nats_with_empty_stream_rejected() {
+        assert_invalid_trigger(
+            r#"      stream: ""
+      subject: "recordings.completed"
+      durable: "transcriber""#,
+            "stream is empty",
+        );
+    }
+
+    #[test]
+    fn nats_with_empty_subject_rejected() {
+        assert_invalid_trigger(
+            r#"      stream: "recordings"
+      subject: "   "
+      durable: "transcriber""#,
+            "subject is empty",
+        );
+    }
+
+    #[test]
+    fn nats_with_empty_durable_rejected() {
+        assert_invalid_trigger(
+            r#"      stream: "recordings"
+      subject: "recordings.completed"
+      durable: """#,
+            "durable is empty",
+        );
+    }
+
+    #[test]
+    fn nats_with_zero_max_deliver_rejected() {
+        assert_invalid_trigger(
+            r#"      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "transcriber"
+      max_deliver: 0"#,
+            "max_deliver is 0 - JetStream reads that as unlimited",
+        );
+    }
+
+    #[test]
+    fn nats_with_empty_publish_rejected() {
+        assert_invalid_trigger(
+            r#"      stream: "recordings"
+      subject: "recordings.completed"
+      durable: "transcriber"
+      publish: """#,
+            "publish is empty",
+        );
     }
 
     #[test]

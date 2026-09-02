@@ -41,6 +41,9 @@ pub fn handle_error(error: Error) -> ! {
             "Script '{}' has a nats trigger but settings.nats is missing",
             name
         ),
+        Error::InvalidNatsTrigger { name, reason } => {
+            format!("Script '{}' has an invalid nats trigger: {}", name, reason)
+        }
         Error::DuplicateDurable {
             stream,
             durable,

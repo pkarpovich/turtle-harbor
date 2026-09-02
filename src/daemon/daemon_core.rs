@@ -598,6 +598,11 @@ impl DaemonCore {
         env: HashMap<OsString, OsString>,
         reply_tx: oneshot::Sender<JobOutcome>,
     ) {
+        if reply_tx.is_closed() {
+            tracing::info!(script = %name, "Job trigger dropped - the listener that sent it is gone");
+            return;
+        }
+
         if !self.nats.is_listening(name) {
             tracing::info!(script = %name, "Job trigger declined - listener not registered");
             let _ = reply_tx.send(JobOutcome::NotStarted);
@@ -665,11 +670,13 @@ impl DaemonCore {
     }
 
     async fn handle_job_timeout(&mut self, name: &str) {
-        tracing::error!(script = %name, "Job timed out - stopping process");
+        let Some(reply_tx) = self.pending_jobs.remove(name) else {
+            tracing::debug!(script = %name, "Dropping job timeout - the run already finished");
+            return;
+        };
 
-        if let Some(reply_tx) = self.pending_jobs.remove(name) {
-            let _ = reply_tx.send(JobOutcome::TimedOut);
-        }
+        tracing::error!(script = %name, "Job timed out - stopping process");
+        let _ = reply_tx.send(JobOutcome::TimedOut);
 
         {
             let mut snapshot = self.health.write().await;
@@ -699,10 +706,19 @@ impl DaemonCore {
         let entry = snapshot
             .entry(name.to_string())
             .or_insert_with(|| ScriptHealth::never_ran(name.to_string()));
-        entry.healthy = true;
         if entry.last_run_at.is_none() {
             entry.state = ScriptHealthState::NeverRan;
+            entry.healthy = true;
+            return;
         }
+
+        let succeeded = entry.last_exit_code == Some(0);
+        entry.state = if succeeded {
+            ScriptHealthState::Succeeded
+        } else {
+            ScriptHealthState::Failed
+        };
+        entry.healthy = succeeded;
     }
 
     async fn handle_listener_failed(&mut self, name: &str, error: &str) {
@@ -713,7 +729,6 @@ impl DaemonCore {
             .or_insert_with(|| ScriptHealth::never_ran(name.to_string()));
         entry.healthy = false;
         entry.state = ScriptHealthState::Failed;
-        entry.last_exit_code = None;
     }
 
     async fn start_scripts(&mut self, name: Option<String>, config_path: &Path) -> Result<()> {
@@ -879,6 +894,7 @@ impl DaemonCore {
             .remove(name);
         self.cron.cancel(name);
         self.nats.cancel(name).await;
+        self.pending_jobs.remove(name);
         tracing::info!(script = %name, "Script stopped successfully");
         Ok(())
     }
@@ -1227,6 +1243,7 @@ impl DaemonCore {
         }
         self.cron.cancel(name);
         self.nats.cancel(name).await;
+        self.pending_jobs.remove(name);
         if let Err(e) = self.state.remove_script(name).await {
             tracing::error!(script = %name, error = ?e, "Failed to remove from state during forget_script");
         }
@@ -2055,6 +2072,99 @@ scripts:
     }
 
     #[tokio::test]
+    async fn job_timeout_after_the_run_finished_is_ignored() {
+        let (mut core, _tmp, _cfg) = setup_job_core("exit 0").await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+        drain_process_exit(&mut core).await;
+        assert_eq!(reply_rx.await.unwrap(), JobOutcome::Exited(0));
+
+        core.handle_job_timeout("job").await;
+
+        let entry = stored_status(&core, "job");
+        assert_eq!(entry.status, ProcessStatus::Listening);
+        assert_eq!(
+            entry.exit_code,
+            Some(0),
+            "a late timeout must not erase the exit code of a finished run"
+        );
+        assert!(!entry.explicitly_stopped);
+
+        let snapshot = core.health.read().await;
+        let health = snapshot.get("job").expect("health entry must exist");
+        assert!(health.healthy, "a late timeout must not fail a healthy job");
+        assert!(!is_failed(&health.state));
+    }
+
+    #[tokio::test]
+    async fn job_trigger_with_a_gone_listener_does_not_spawn() {
+        let (mut core, _tmp, _cfg) = setup_job_core("sleep 30").await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        drop(reply_rx);
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+
+        assert!(!core.supervisor.contains("job"));
+        assert!(core.pending_jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_script_clears_the_pending_job() {
+        let (mut core, _tmp, cfg_path) = setup_job_core("sleep 30").await;
+
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+        assert!(core.pending_jobs.contains_key("job"));
+
+        core.stop_scripts(Some("job".to_string()), Some(&cfg_path))
+            .await
+            .unwrap();
+
+        assert!(core.pending_jobs.is_empty());
+        assert!(!core.nats.is_listening("job"));
+    }
+
+    #[tokio::test]
+    async fn listener_ready_keeps_a_failed_run_unhealthy() {
+        let (mut core, _tmp, _cfg) = setup_job_core("exit 1").await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+        drain_process_exit(&mut core).await;
+        assert_eq!(reply_rx.await.unwrap(), JobOutcome::Exited(1));
+
+        core.handle_listener_ready("job").await;
+
+        let snapshot = core.health.read().await;
+        let health = snapshot.get("job").expect("health entry must exist");
+        assert!(
+            !health.healthy,
+            "a listener rebind must not mask the failed run"
+        );
+        assert!(is_failed(&health.state));
+    }
+
+    #[tokio::test]
+    async fn listener_ready_restores_health_after_a_successful_run() {
+        let (mut core, _tmp, _cfg) = setup_job_core("exit 0").await;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+        drain_process_exit(&mut core).await;
+        assert_eq!(reply_rx.await.unwrap(), JobOutcome::Exited(0));
+
+        core.handle_listener_failed("job", "connection refused")
+            .await;
+        core.handle_listener_ready("job").await;
+
+        let snapshot = core.health.read().await;
+        let health = snapshot.get("job").expect("health entry must exist");
+        assert!(health.healthy);
+        assert!(!is_failed(&health.state));
+    }
+
+    #[tokio::test]
     async fn listener_failed_then_ready_toggles_health() {
         let (mut core, _tmp) = make_core();
 
@@ -2214,8 +2324,13 @@ scripts:
     }
 
     #[tokio::test]
-    async fn shutdown_cancels_listeners_before_stopping_processes() {
-        let (mut core, _tmp, _cfg) = setup_listening_core("echo job").await;
+    async fn shutdown_cancels_listeners_and_stops_the_running_job() {
+        let (mut core, _tmp, _cfg) = setup_job_core("sleep 30").await;
+
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        core.handle_job_trigger("job", job_env(), reply_tx).await;
+        assert!(core.nats.is_listening("job"));
+        assert!(core.supervisor.contains("job"));
 
         core.shutdown().await.unwrap();
 

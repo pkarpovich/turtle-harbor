@@ -42,7 +42,7 @@ enum SessionExit {
 
 enum AfterMessage {
     Continue,
-    Stop(SessionExit),
+    Stop,
 }
 
 enum JobResolution {
@@ -56,11 +56,8 @@ enum PublishFailure {
 }
 
 struct Attempt {
-    subject: String,
+    input: JobInput,
     stream_sequence: u64,
-    delivery: Delivery,
-    traceparent: Option<String>,
-    result_path: Option<PathBuf>,
 }
 
 struct Session {
@@ -199,7 +196,7 @@ pub fn server_max_deliver(max_deliver: i64) -> u32 {
     u32::try_from(max_deliver).unwrap_or(u32::MAX)
 }
 
-async fn run_listener(config: ListenerConfig, shutdown: watch::Receiver<bool>) {
+async fn run_listener(config: ListenerConfig, mut shutdown: watch::Receiver<bool>) {
     tracing::debug!(script = %config.name, url = %config.url, subject = %config.trigger.subject, "Listener started");
 
     loop {
@@ -207,8 +204,7 @@ async fn run_listener(config: ListenerConfig, shutdown: watch::Receiver<bool>) {
             break;
         }
 
-        let mut session_shutdown = shutdown.clone();
-        match run_session(&config, &mut session_shutdown).await {
+        match run_session(&config, &mut shutdown).await {
             SessionExit::Shutdown => break,
             SessionExit::Failed(error) => {
                 tracing::warn!(script = %config.name, %error, "NATS listener failed, retrying");
@@ -225,10 +221,9 @@ async fn run_listener(config: ListenerConfig, shutdown: watch::Receiver<bool>) {
             }
         }
 
-        let mut delay_shutdown = shutdown.clone();
         tokio::select! {
             biased;
-            _ = delay_shutdown.changed() => break,
+            _ = shutdown.changed() => break,
             _ = tokio::time::sleep(RETRY_DELAY) => {}
         }
     }
@@ -273,7 +268,7 @@ async fn run_session(config: &ListenerConfig, shutdown: &mut watch::Receiver<boo
 
         match session.handle_message(message, shutdown).await {
             AfterMessage::Continue => {}
-            AfterMessage::Stop(exit) => return exit,
+            AfterMessage::Stop => return SessionExit::Shutdown,
         }
     }
 }
@@ -378,21 +373,18 @@ impl Session {
             return AfterMessage::Continue;
         };
 
-        let attempt = Attempt {
+        let input = JobInput {
+            payload,
             subject,
-            stream_sequence,
             delivery,
             traceparent: traceparent(message.headers.as_ref()),
             result_path: self.prepare_result_file(),
         };
-
-        let env = job::job_env(&JobInput {
-            payload,
-            subject: attempt.subject.clone(),
-            delivery,
-            traceparent: attempt.traceparent.clone(),
-            result_path: attempt.result_path.clone(),
-        });
+        let env = job::job_env(&input);
+        let attempt = Attempt {
+            input,
+            stream_sequence,
+        };
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let sent = self
@@ -406,7 +398,7 @@ impl Session {
             .await;
         let Ok(()) = sent else {
             self.remove_result_file(&attempt);
-            return AfterMessage::Stop(SessionExit::Shutdown);
+            return AfterMessage::Stop;
         };
 
         let outcome = match self.await_outcome(&message, reply_rx, shutdown).await {
@@ -419,19 +411,31 @@ impl Session {
                     tracing::error!(script = %name, error = %e, "Failed to nak in-flight message on shutdown");
                 }
                 self.remove_result_file(&attempt);
-                return AfterMessage::Stop(SessionExit::Shutdown);
+                return AfterMessage::Stop;
             }
         };
 
         let verdict = self.decide(&attempt, outcome.clone()).await;
+        match verdict {
+            Verdict::Term => tracing::error!(
+                script = %name,
+                subject = %attempt.input.subject,
+                stream_sequence = attempt.stream_sequence,
+                delivered = attempt.input.delivery.delivered,
+                max_deliver = attempt.input.delivery.max_deliver,
+                ?outcome,
+                "Terminating message - it will not be redelivered"
+            ),
+            Verdict::Ack | Verdict::Nak => {}
+        }
         self.settle(&message, verdict).await;
         self.remove_result_file(&attempt);
 
         tracing::info!(
             script = %name,
-            subject = %attempt.subject,
+            subject = %attempt.input.subject,
             stream_sequence = attempt.stream_sequence,
-            delivered = attempt.delivery.delivered,
+            delivered = attempt.input.delivery.delivered,
             ?outcome,
             ?verdict,
             "Job attempt settled"
@@ -469,7 +473,7 @@ impl Session {
                 }
                 _ = shutdown.changed() => return JobResolution::Shutdown,
                 _ = &mut timeout => {
-                    return self.resolve_timeout(reply_rx).await;
+                    return self.resolve_timeout(reply_rx, shutdown).await;
                 }
                 _ = progress.tick() => {
                     if let Err(e) = message.ack_with(AckKind::Progress).await {
@@ -480,7 +484,11 @@ impl Session {
         }
     }
 
-    async fn resolve_timeout(&self, reply_rx: oneshot::Receiver<JobOutcome>) -> JobResolution {
+    async fn resolve_timeout(
+        &self,
+        reply_rx: oneshot::Receiver<JobOutcome>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> JobResolution {
         let name = self.config.name.as_str();
         tracing::error!(script = %name, timeout_secs = self.config.trigger.job_timeout.as_secs(), "Job exceeded job_timeout");
 
@@ -495,15 +503,19 @@ impl Session {
             return JobResolution::Outcome(JobOutcome::TimedOut);
         };
 
-        match tokio::time::timeout(TIMEOUT_GRACE, reply_rx).await {
-            Ok(Ok(outcome)) => JobResolution::Outcome(outcome),
-            Ok(Err(_)) => JobResolution::Outcome(JobOutcome::TimedOut),
-            Err(_) => JobResolution::Outcome(JobOutcome::TimedOut),
+        tokio::select! {
+            biased;
+            reply = reply_rx => match reply {
+                Ok(outcome) => JobResolution::Outcome(outcome),
+                Err(_) => JobResolution::Outcome(JobOutcome::TimedOut),
+            },
+            _ = shutdown.changed() => JobResolution::Shutdown,
+            _ = tokio::time::sleep(TIMEOUT_GRACE) => JobResolution::Outcome(JobOutcome::TimedOut),
         }
     }
 
     async fn decide(&self, attempt: &Attempt, outcome: JobOutcome) -> Verdict {
-        let verdict = job::verdict(outcome, attempt.delivery);
+        let verdict = job::verdict(outcome, attempt.input.delivery);
         match verdict {
             Verdict::Nak => return Verdict::Nak,
             Verdict::Term => return Verdict::Term,
@@ -519,7 +531,7 @@ impl Session {
             Err(PublishFailure::Contract(reason)) => {
                 tracing::error!(
                     script = %self.config.name,
-                    subject = %attempt.subject,
+                    subject = %attempt.input.subject,
                     stream_sequence = attempt.stream_sequence,
                     %reason,
                     "Job result file violates the contract, terminating message"
@@ -534,7 +546,7 @@ impl Session {
                     %reason,
                     "Failed to publish job result"
                 );
-                job::verdict(JobOutcome::PublishFailed, attempt.delivery)
+                job::verdict(JobOutcome::PublishFailed, attempt.input.delivery)
             }
         }
     }
@@ -544,7 +556,7 @@ impl Session {
         subject: &str,
         attempt: &Attempt,
     ) -> std::result::Result<(), PublishFailure> {
-        let Some(path) = &attempt.result_path else {
+        let Some(path) = &attempt.input.result_path else {
             return Err(PublishFailure::Transient(
                 "result file was never created".to_string(),
             ));
@@ -555,7 +567,7 @@ impl Session {
             Err(e) => return Err(PublishFailure::Contract(e.to_string())),
         };
 
-        let headers = publish_headers(attempt.traceparent.as_deref());
+        let headers = publish_headers(attempt.input.traceparent.as_deref());
         let ack = self
             .context
             .publish_with_headers(subject.to_string(), headers, payload.into())
@@ -602,7 +614,7 @@ impl Session {
     }
 
     fn remove_result_file(&self, attempt: &Attempt) {
-        let Some(path) = &attempt.result_path else {
+        let Some(path) = &attempt.input.result_path else {
             return;
         };
         if let Err(e) = std::fs::remove_file(path) {
@@ -630,7 +642,6 @@ pub fn read_result(path: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::paths;
     use tempfile::TempDir;
 
     const DEAD_URL: &str = "nats://127.0.0.1:1";
@@ -742,13 +753,6 @@ mod tests {
     }
 
     #[test]
-    fn test_result_path_under_jobs_dir() {
-        let path = paths::result_path("x");
-        assert!(path.ends_with("x.result.json"));
-        assert_eq!(path.parent(), Some(paths::jobs_dir().as_path()));
-    }
-
-    #[test]
     fn test_delivered_count_never_below_one() {
         assert_eq!(delivered_count(0), 1);
         assert_eq!(delivered_count(-3), 1);
@@ -772,6 +776,31 @@ mod tests {
 
         manager.listen("job", &trigger, DEAD_URL).await;
         assert!(manager.is_listening("job"));
+
+        manager.cancel("job").await;
+        assert!(!manager.is_listening("job"));
+    }
+
+    #[tokio::test]
+    async fn test_listener_reports_a_bind_failure() {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut manager = NatsManager::new(event_tx);
+
+        manager
+            .listen("job", &make_trigger(), "http://127.0.0.1:4222")
+            .await;
+
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("listener must report the failure")
+            .expect("event channel closed");
+        match event {
+            DaemonEvent::ListenerFailed { name, error } => {
+                assert_eq!(name, "job");
+                assert!(!error.is_empty());
+            }
+            _ => panic!("expected ListenerFailed"),
+        }
 
         manager.cancel("job").await;
         assert!(!manager.is_listening("job"));

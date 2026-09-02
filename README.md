@@ -171,7 +171,8 @@ scripts:
 
 `settings.nats.url` is required as soon as any script has a `nats:` block. A `nats:` script may not also set
 `cron:` or `restart_policy: always`, and two scripts across all loaded configs may not share the same
-`(stream, durable)` pair.
+`(stream, durable)` pair. `stream`, `subject`, `durable` and `publish` are rejected when empty, and `max_deliver`
+may not be `0` - JetStream reads a zero limit as unlimited, which is never what the field is asking for.
 
 ### Job environment
 
@@ -198,11 +199,30 @@ by an existing stream - the daemon never creates streams.
 | exit `0`                                         | `Ack`                                                |
 | exit `65`                                        | `Term` - the job declares the message unprocessable  |
 | any other exit code, signal, timeout, publish failure | `Nak` with `nak_delay`, or `Term` once deliveries are exhausted |
-| the job never started, or its reply was lost     | `Nak` - the attempt does not count against the limit |
+| the job never started, or its reply was lost     | `Nak` - the daemon never terminates the message itself |
+
+The daemon never turns a "never ran" attempt into a `Term`, but JetStream still counts every redelivery: a job that
+repeatedly fails to start eventually exhausts the consumer's `max_deliver` and stops being redelivered.
 
 `th down`, a reload and daemon shutdown nak the in-flight message with zero delay and wait for the server to confirm,
 so a stop never strands a message. While a job runs the daemon sends a progress heartbeat every 30 seconds, so
 `ack_wait` can be far shorter than the job.
+
+### When the server is unreachable
+
+`th up` registers the listener without waiting for a connection, so it succeeds - and `th ps` shows `listening` -
+even when NATS is down or the stream does not exist. The listener retries the whole setup every 30 seconds, logging
+each failure at warn level. A listener that has not bound reports the script as unhealthy on `/health`; that is the
+only place the difference shows. The daemon never creates streams, so a misspelled `stream:` retries forever.
+
+### Stopping and restarting
+
+`th down <job>` naks the in-flight message with zero delay, unregisters the listener so no further messages are
+pulled, and records the script as explicitly stopped - `th ps` then shows `exited` until the next `th up`.
+
+On daemon startup every `nats:` script that was not explicitly stopped has its listener re-registered and is
+persisted as `listening`, whatever its last recorded status was. A job needs no `th up` after a daemon restart; an
+explicitly stopped one stays down.
 
 ### Consumer binding
 
