@@ -297,10 +297,7 @@ async fn bind(config: &ListenerConfig) -> std::result::Result<Session, String> {
         event_tx: _,
     } = config;
 
-    let client = ConnectOptions::new()
-        .retry_on_initial_connect()
-        .connect(url.as_str())
-        .await;
+    let client = ConnectOptions::new().connect(url.as_str()).await;
     let client = match client {
         Ok(client) => client,
         Err(e) => return Err(format!("connect to {}: {e}", redact_url(url))),
