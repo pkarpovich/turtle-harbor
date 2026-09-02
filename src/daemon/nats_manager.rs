@@ -21,6 +21,7 @@ const BATCH_EXPIRES: Duration = Duration::from_secs(60);
 const BATCH_HEARTBEAT: Duration = Duration::from_secs(20);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const TIMEOUT_GRACE: Duration = Duration::from_secs(10);
+const SHUTDOWN_DRAIN: Duration = Duration::from_millis(500);
 
 pub struct Listener {
     handle: JoinHandle<()>,
@@ -43,6 +44,14 @@ enum SessionExit {
 enum AfterMessage {
     Continue,
     Stop,
+}
+
+enum NextMessage {
+    Message(Message),
+    Idle,
+    Failed(String),
+    Shutdown,
+    ShutdownWith(Message),
 }
 
 enum JobResolution {
@@ -270,16 +279,15 @@ async fn run_session(config: &ListenerConfig, shutdown: &mut watch::Receiver<boo
     };
 
     loop {
-        let message = tokio::select! {
-            biased;
-            _ = shutdown.changed() => return SessionExit::Shutdown,
-            message = session.next_message() => message,
-        };
-
-        let message = match message {
-            Ok(Some(message)) => message,
-            Ok(None) => continue,
-            Err(error) => return SessionExit::Failed(error),
+        let message = match session.next_message(shutdown).await {
+            NextMessage::Message(message) => message,
+            NextMessage::Idle => continue,
+            NextMessage::Failed(error) => return SessionExit::Failed(error),
+            NextMessage::Shutdown => return SessionExit::Shutdown,
+            NextMessage::ShutdownWith(message) => {
+                session.nak_now(&message).await;
+                return SessionExit::Shutdown;
+            }
         };
 
         match session.handle_message(message, shutdown).await {
@@ -339,7 +347,7 @@ async fn bind(config: &ListenerConfig) -> std::result::Result<Session, String> {
 }
 
 impl Session {
-    async fn next_message(&self) -> std::result::Result<Option<Message>, String> {
+    async fn next_message(&self, shutdown: &mut watch::Receiver<bool>) -> NextMessage {
         let batch = self
             .consumer
             .batch()
@@ -351,13 +359,34 @@ impl Session {
 
         let mut batch = match batch {
             Ok(batch) => batch,
-            Err(e) => return Err(format!("pull request: {e}")),
+            Err(e) => return NextMessage::Failed(format!("pull request: {e}")),
         };
 
-        match batch.next().await {
-            None => Ok(None),
-            Some(Ok(message)) => Ok(Some(message)),
-            Some(Err(e)) => Err(format!("fetch: {e}")),
+        let next = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                let drained = tokio::time::timeout(SHUTDOWN_DRAIN, batch.next()).await;
+                return match drained {
+                    Ok(Some(Ok(message))) => NextMessage::ShutdownWith(message),
+                    Ok(Some(Err(_))) | Ok(None) | Err(_) => NextMessage::Shutdown,
+                };
+            }
+            next = batch.next() => next,
+        };
+
+        match next {
+            None => NextMessage::Idle,
+            Some(Ok(message)) => NextMessage::Message(message),
+            Some(Err(e)) => NextMessage::Failed(format!("fetch: {e}")),
+        }
+    }
+
+    async fn nak_now(&self, message: &Message) {
+        let nak = message
+            .double_ack_with(AckKind::Nak(Some(Duration::ZERO)))
+            .await;
+        if let Err(e) = nak {
+            tracing::error!(script = %self.config.name, error = %e, "Failed to nak in-flight message on shutdown");
         }
     }
 
@@ -427,12 +456,7 @@ impl Session {
         let outcome = match self.await_outcome(&message, reply_rx, shutdown).await {
             JobResolution::Outcome(outcome) => outcome,
             JobResolution::Shutdown => {
-                let nak = message
-                    .double_ack_with(AckKind::Nak(Some(Duration::ZERO)))
-                    .await;
-                if let Err(e) = nak {
-                    tracing::error!(script = %name, error = %e, "Failed to nak in-flight message on shutdown");
-                }
+                self.nak_now(&message).await;
                 self.remove_result_file(&attempt);
                 return AfterMessage::Stop;
             }
