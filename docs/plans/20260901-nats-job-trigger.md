@@ -296,11 +296,11 @@ A new variant, persisted in `state.json`. `th ps` renders it as `listening` (dim
 - Modify: `src/daemon/daemon_core.rs` (the `full_status_list` and `restore_state` health-mapping matches)
 - Modify: `src/daemon/state.rs` (tests only)
 
-- [ ] add `ProcessStatus::Listening`
-- [ ] add the `Listening` arm to `format_status` rendering `listening` dimmed
-- [ ] add the `Listening` arm wherever `ProcessStatus` is matched in `daemon_core.rs`: `full_status_list` uptime (0), `restore_state` health mapping (`NeverRan`), and the restore filter that decides what to restart (`Listening` is never restarted through the supervisor; Task 8 re-listens it)
-- [ ] write tests: `format_status(Listening, None)` renders `listening`; in `state.rs`, `RunningState` round-trips a `Listening` entry through `save`/`load`
-- [ ] run `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` - must pass before Task 4
+- [x] add `ProcessStatus::Listening`
+- [x] add the `Listening` arm to `format_status` rendering `listening` dimmed
+- [x] add the `Listening` arm wherever `ProcessStatus` is matched in `daemon_core.rs`: `full_status_list` uptime (0), `restore_state` health mapping (`NeverRan`), and the restore filter that decides what to restart (`Listening` is never restarted through the supervisor; Task 8 re-listens it)
+- [x] write tests: `format_status(Listening, None)` renders `listening`; in `state.rs`, `RunningState` round-trips a `Listening` entry through `save`/`load`
+- [x] run `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` - must pass before Task 4
 
 ### Task 4: Pure job contract in `src/daemon/job.rs`
 

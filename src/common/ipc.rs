@@ -70,6 +70,7 @@ pub enum ProcessStatus {
     Stopped,
     Failed,
     Restarting,
+    Listening,
 }
 
 async fn send_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<()> {

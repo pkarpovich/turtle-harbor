@@ -56,6 +56,7 @@ pub fn format_status(status: ProcessStatus, exit_code: Option<i32>) -> ColoredSt
         ProcessStatus::Running => "running".green(),
         ProcessStatus::Stopped => "exited (0)".dimmed(),
         ProcessStatus::Restarting => "restarting".yellow(),
+        ProcessStatus::Listening => "listening".dimmed(),
         ProcessStatus::Failed => {
             let code = exit_code.unwrap_or(-1);
             format!("failed ({})", code).red().bold()
@@ -272,4 +273,28 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_status_renders_listening() {
+        assert_eq!(&*format_status(ProcessStatus::Listening, None), "listening");
+    }
+
+    #[test]
+    fn format_status_renders_other_states() {
+        assert_eq!(&*format_status(ProcessStatus::Running, None), "running");
+        assert_eq!(&*format_status(ProcessStatus::Stopped, None), "exited (0)");
+        assert_eq!(
+            &*format_status(ProcessStatus::Restarting, None),
+            "restarting"
+        );
+        assert_eq!(
+            &*format_status(ProcessStatus::Failed, Some(2)),
+            "failed (2)"
+        );
+    }
 }

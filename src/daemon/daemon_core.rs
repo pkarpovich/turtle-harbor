@@ -194,7 +194,9 @@ impl DaemonCore {
                             .unwrap_or_default()
                     })
                     .unwrap_or_default(),
-                _ => Duration::default(),
+                ProcessStatus::Stopped | ProcessStatus::Failed | ProcessStatus::Listening => {
+                    Duration::default()
+                }
             };
 
             result.insert(
@@ -769,6 +771,7 @@ impl DaemonCore {
                         ScriptHealthState::Running
                     }
                     ProcessStatus::Failed => ScriptHealthState::Failed,
+                    ProcessStatus::Listening => ScriptHealthState::NeverRan,
                     ProcessStatus::Stopped => {
                         if script.exit_code == Some(0) || script.exit_code.is_none() {
                             ScriptHealthState::Succeeded
