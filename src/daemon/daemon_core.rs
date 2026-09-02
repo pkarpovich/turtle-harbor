@@ -579,6 +579,11 @@ impl DaemonCore {
             tracing::error!(script = %name, "Cannot register listener - settings.nats.url is missing");
             return;
         };
+        if self.nats.is_bound(name, trigger, &url) {
+            tracing::debug!(script = %name, "Listener already bound to this trigger - skipping");
+            return;
+        }
+        self.abort_job_before_rebind(name).await;
         self.nats.listen(name, trigger, &url).await;
     }
 
@@ -874,9 +879,7 @@ impl DaemonCore {
                     .entry(name.to_string())
                     .or_insert_with(|| ScriptHealth::never_ran(name.to_string()));
             }
-            if !self.nats.is_listening(name) {
-                self.register_listener(name, config_path, &trigger).await;
-            }
+            self.register_listener(name, config_path, &trigger).await;
             return Ok(ScriptStartResult::Started);
         }
 
@@ -2512,6 +2515,57 @@ scripts:
         core.reload_config(&cfg_path).await.unwrap();
 
         assert!(core.nats.is_listening("job"));
+    }
+
+    fn trigger_of(core: &DaemonCore, cfg_path: &Path, name: &str) -> NatsTrigger {
+        core.config
+            .script(cfg_path, name)
+            .expect("script must be in config")
+            .nats
+            .clone()
+            .expect("script must carry a nats trigger")
+    }
+
+    #[tokio::test]
+    async fn up_rebinds_a_listener_after_the_trigger_changes() {
+        let (mut core, _tmp, cfg_path) = setup_listening_core("echo job").await;
+        let old = trigger_of(&core, &cfg_path, "job");
+        assert!(core.nats.is_bound("job", &old, DEAD_NATS_URL));
+
+        std::fs::write(
+            &cfg_path,
+            job_config("echo job").replace("recordings.completed", "recordings.retried"),
+        )
+        .unwrap();
+        core.config.load(&cfg_path).unwrap();
+        core.start_scripts(Some("job".to_string()), &cfg_path)
+            .await
+            .unwrap();
+
+        let new = trigger_of(&core, &cfg_path, "job");
+        assert_ne!(old.subject, new.subject);
+        assert!(
+            core.nats.is_bound("job", &new, DEAD_NATS_URL),
+            "up must rebind the listener to the subject the config now names"
+        );
+        assert!(!core.nats.is_bound("job", &old, DEAD_NATS_URL));
+    }
+
+    #[tokio::test]
+    async fn up_rebinds_a_listener_after_the_nats_url_changes() {
+        let (mut core, _tmp, cfg_path) = setup_listening_core("echo job").await;
+        let trigger = trigger_of(&core, &cfg_path, "job");
+        assert!(core.nats.is_bound("job", &trigger, DEAD_NATS_URL));
+
+        let moved = "nats://127.0.0.1:14444";
+        std::fs::write(&cfg_path, job_config_with_url("echo job", moved)).unwrap();
+        core.config.load(&cfg_path).unwrap();
+        core.start_scripts(Some("job".to_string()), &cfg_path)
+            .await
+            .unwrap();
+
+        assert!(core.nats.is_bound("job", &trigger, moved));
+        assert!(!core.nats.is_bound("job", &trigger, DEAD_NATS_URL));
     }
 
     #[tokio::test]

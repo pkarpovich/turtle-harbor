@@ -25,6 +25,8 @@ const SHUTDOWN_DRAIN: Duration = Duration::from_millis(500);
 pub struct Listener {
     handle: JoinHandle<()>,
     shutdown: watch::Sender<bool>,
+    trigger: NatsTrigger,
+    url: String,
 }
 
 #[derive(Clone)]
@@ -107,8 +109,15 @@ impl NatsManager {
 
         let handle = tokio::spawn(run_listener(config, shutdown_rx));
 
-        self.tasks
-            .insert(name.to_string(), Listener { handle, shutdown });
+        self.tasks.insert(
+            name.to_string(),
+            Listener {
+                handle,
+                shutdown,
+                trigger: trigger.clone(),
+                url: url.to_string(),
+            },
+        );
         tracing::info!(script = %name, "Listener registered");
     }
 
@@ -121,7 +130,13 @@ impl NatsManager {
     }
 
     pub async fn cancel(&mut self, name: &str) {
-        let Some(Listener { handle, shutdown }) = self.tasks.remove(name) else {
+        let Some(Listener {
+            handle,
+            shutdown,
+            trigger: _,
+            url: _,
+        }) = self.tasks.remove(name)
+        else {
             return;
         };
 
@@ -141,7 +156,12 @@ impl NatsManager {
     pub async fn cancel_all(&mut self) {
         let mut stopping = Vec::new();
         for (name, listener) in self.tasks.drain() {
-            let Listener { handle, shutdown } = listener;
+            let Listener {
+                handle,
+                shutdown,
+                trigger: _,
+                url: _,
+            } = listener;
             let _ = shutdown.send(true);
             stopping.push((name, handle));
         }
@@ -164,6 +184,13 @@ impl NatsManager {
 
     pub fn is_listening(&self, name: &str) -> bool {
         self.tasks.contains_key(name)
+    }
+
+    pub fn is_bound(&self, name: &str, trigger: &NatsTrigger, url: &str) -> bool {
+        let Some(listener) = self.tasks.get(name) else {
+            return false;
+        };
+        !listener.handle.is_finished() && listener.trigger == *trigger && listener.url == url
     }
 }
 
